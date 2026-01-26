@@ -1,5 +1,6 @@
 # CE888 Agentic Data Scientist - Student Template
 
+**Name** Francisco Antontio Alamo Rios
 **Assignment:** Offline Agentic AI for Data Science  
 **Module:** CE888  
 **Academic Year:** 2025/2026
