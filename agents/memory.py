@@ -35,11 +35,35 @@ class JSONMemory:
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(self.data, f, indent=2)
 
-    def get_dataset_record(self, fingerprint: str) -> Optional[Dict[str, Any]]:
-        return self.data.get("datasets", {}).get(fingerprint)
+    def get_dataset_record(self, fingerprint: str, dataset_name: Optional[str] = None, target: Optional[str] = None, shape: Optional[Dict] = None) -> Optional[Dict[str, Any]]:
+        datasets = self.data.get("datasets", {})
+        # 1. Exact fingerprint match (same filename)
+        if fingerprint in datasets:
+            return datasets[fingerprint]
+        # 2. Same dataset name
+        if dataset_name:
+            for record in datasets.values():
+                if record.get("dataset") == dataset_name:
+                    return record
+        # 3. Same target + shape (renamed file)
+        if target and shape:
+            for record in datasets.values():
+                if record.get("target") == target and record.get("shape") == shape:
+                    return record
+        return None
 
     def upsert_dataset_record(self, fingerprint: str, record: Dict[str, Any]) -> None:
-        self.data.setdefault("datasets", {})[fingerprint] = record
+        datasets = self.data.setdefault("datasets", {})
+        # If a record with the same target + shape already exists, update it in place
+        target = record.get("target")
+        shape = record.get("shape")
+        for existing_fp, existing_record in datasets.items():
+            if existing_record.get("target") == target and existing_record.get("shape") == shape:
+                datasets[existing_fp] = record
+                self.save()
+                return
+        # No match — new dataset, store under the fingerprint key
+        datasets[fingerprint] = record
         self.save()
 
     def add_note(self, msg: str) -> None:

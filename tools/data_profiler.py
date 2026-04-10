@@ -1,7 +1,7 @@
 import hashlib
+import profile
 from typing import Any, Dict, List, Optional
 import pandas as pd
-
 
 def infer_schema(df: pd.DataFrame, cat_max_unique: int = 20) -> Dict[str, str]:
     """
@@ -24,7 +24,6 @@ def infer_schema(df: pd.DataFrame, cat_max_unique: int = 20) -> Dict[str, str]:
             n_unique = s.dropna().nunique()
             out[col] = "categorical" if n_unique <= cat_max_unique else "text"
     return out
-
 
 def infer_target_column(df: pd.DataFrame) -> Optional[str]:
     """
@@ -86,15 +85,12 @@ def is_classification_target(series: pd.Series) -> bool:
     
     return uniq <= 50
 
-
-
 def dataset_fingerprint(df: pd.DataFrame, target: str, file_path: str = "") -> str:
     # Stable hash using filename + target + column names
     # Row count excluded — changes after deduplication
     cols = ",".join(df.columns.astype(str).tolist())
     base = f"{file_path}|{target}|{cols}"
     return "fp_" + hashlib.md5(base.encode()).hexdigest()[:12]
-
 
 def detect_near_constant(df: pd.DataFrame, threshold: float = 0.95) -> List[str]:
     """
@@ -130,6 +126,35 @@ def detect_outliers(df: pd.DataFrame, numeric_cols: List[str], threshold: float 
             outlier_cols.append(col)
     return outlier_cols
 
+def ordinal_report(
+    df: pd.DataFrame,
+    schema: Dict[str, str],
+    nunique_map: Dict[str, int],
+    max_unique: int = 20,
+    int_tol: float = 1e-6,
+) -> List[tuple]:
+    out = []
+
+    for col, t in schema.items():
+        if t != "numeric" or col not in df.columns:
+            continue
+
+        u = int(nunique_map.get(col, 0))
+        if u == 0 or u > max_unique:
+            continue
+
+        s = pd.to_numeric(df[col], errors="coerce").dropna()
+        if s.empty:
+            continue
+
+        frac_int = float(((s - s.round()).abs() <= int_tol).mean())
+
+        if frac_int >= 0.95:
+            out.append((col, u, round(frac_int, 3)))
+
+    out.sort(key=lambda x: x[1])
+    return out
+
 
 def profile_dataset(df: pd.DataFrame, target: str) -> Dict[str, Any]:
     if target not in df.columns:
@@ -158,6 +183,23 @@ def profile_dataset(df: pd.DataFrame, target: str) -> Dict[str, Any]:
 
     profile["feature_types"] = {"numeric": numeric_cols, "categorical": cat_cols}
     profile["n_unique_by_col"] = {str(c): int(df[c].nunique(dropna=True)) for c in df.columns.astype(str)}
+
+    ord_cols = ordinal_report(
+    df,
+    profile["schema"],
+    profile["n_unique_by_col"],
+    max_unique=20,
+    )
+    if profile["has_ordinal"]:
+        notes.append(
+        f"Ordinal-like numeric columns detected: {profile['ordinal_cols'][:5]}. "
+        "These may represent ordered levels rather than continuous measurements."
+    )
+
+
+    profile["ordinal"] = ord_cols
+    profile["has_ordinal"] = len(ord_cols) > 0
+    profile["ordinal_cols"] = [c for c, _, _ in ord_cols]
 
     notes = []
     if profile["shape"]["rows"] < 1000:
@@ -203,3 +245,4 @@ def profile_dataset(df: pd.DataFrame, target: str) -> Dict[str, Any]:
         profile["notes"].append("Regression target detected: using regression models and metrics.")
 
     return profile
+

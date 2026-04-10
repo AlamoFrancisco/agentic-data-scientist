@@ -137,8 +137,13 @@ class AgenticDataScientist:
         profile["dataset"] = self.ctx.data_path
         fp = dataset_fingerprint(self._raw_df, self.ctx.target, file_path=self.ctx.data_path)
 
-        # Look up previous runs for the same dataset fingerprint (memory hint)
-        prev = self.memory.get_dataset_record(fp)
+        # Look up previous runs — by fingerprint, then filename, then target+shape
+        prev = self.memory.get_dataset_record(
+            fp,
+            dataset_name=self.ctx.data_path,
+            target=self.ctx.target,
+            shape=profile["shape"],
+        )
         if prev:
             self.log(f"Memory hit: previously best={prev.get('best_model')} for fp={fp}")
 
@@ -229,6 +234,7 @@ class AgenticDataScientist:
             )
 
             # Update the memory store with outcomes from this run
+            # Also stored under fp_struct so renamed files still get a memory hit
             self.memory.upsert_dataset_record(fp, {
                 "last_seen": now_iso(),
                 "dataset": self.ctx.data_path,
