@@ -38,6 +38,11 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     num_cols = profile["feature_types"]["numeric"]
     cat_cols = profile["feature_types"]["categorical"]
 
+    # Drop near-constant columns — they carry no signal and hurt one-hot encoding
+    near_const = profile.get("near_constant_cols", [])
+    num_cols = [c for c in num_cols if c not in near_const]
+    cat_cols = [c for c in cat_cols if c not in near_const]
+
     # Drop high cardinality categoricals
     n_unique = profile.get("n_unique_by_col", {})
     rows = profile["shape"]["rows"]

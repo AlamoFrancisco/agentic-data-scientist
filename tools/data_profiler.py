@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import pandas as pd
 
 
@@ -47,8 +47,8 @@ def infer_target_column(df: pd.DataFrame) -> Optional[str]:
     last = df.columns[-1]
     uniq = nunique[last]
 
-    # Skip if almost all values are unique — likely an ID
-    if n > 0 and (uniq / n) > 0.9:
+    # Skip if almost all values are unique — likely an ID (true IDs are ~100% unique)
+    if n > 0 and (uniq / n) > 0.99:
         pass
     # Skip text columns
     elif schema.get(last) == "text":
@@ -91,6 +91,41 @@ def dataset_fingerprint(df: pd.DataFrame, target: str) -> str:
     return f"fp_{h}"
 
 
+def detect_near_constant(df: pd.DataFrame, threshold: float = 0.95) -> List[str]:
+    """
+    Return columns where a single value appears in >= threshold fraction of rows.
+    These carry almost no signal and can cause issues with one-hot encoding.
+    Adapted from EDA notebook near-constant detection logic.
+    """
+    near_const = []
+    for col in df.columns:
+        top_freq = df[col].value_counts(normalize=True, dropna=False).iloc[0]
+        if top_freq >= threshold:
+            near_const.append(col)
+    return near_const
+
+
+def detect_outliers(df: pd.DataFrame, numeric_cols: List[str], threshold: float = 0.05) -> List[str]:
+    """
+    Return numeric columns where more than `threshold` fraction of values fall
+    outside the IQR fence (Q1 - 1.5*IQR, Q3 + 1.5*IQR).
+    Adapted from EDA notebook IQR outlier detection logic.
+    """
+    outlier_cols = []
+    for col in numeric_cols:
+        s = df[col].dropna()
+        if len(s) == 0:
+            continue
+        q1, q3 = s.quantile(0.25), s.quantile(0.75)
+        iqr = q3 - q1
+        if iqr == 0:
+            continue
+        n_out = int(((s < q1 - 1.5 * iqr) | (s > q3 + 1.5 * iqr)).sum())
+        if n_out / len(s) > threshold:
+            outlier_cols.append(col)
+    return outlier_cols
+
+
 def profile_dataset(df: pd.DataFrame, target: str) -> Dict[str, Any]:
     if target not in df.columns:
         raise ValueError(f"Target column '{target}' not found in dataset columns.")
@@ -124,6 +159,26 @@ def profile_dataset(df: pd.DataFrame, target: str) -> Dict[str, Any]:
         notes.append("Small dataset (<1000 rows): prefer simpler models / guard against overfitting.")
     if profile["shape"]["cols"] > 100:
         notes.append("High dimensionality (>100 columns): watch one-hot expansion and overfitting.")
+
+    # Duplicate detection — adapted from EDA notebook
+    dup_count = int(df.duplicated().sum())
+    profile["duplicate_count"] = dup_count
+    profile["duplicate_pct"] = round(dup_count / max(len(df), 1) * 100, 2)
+    if dup_count > 0:
+        notes.append(f"Found {dup_count} duplicate rows ({profile['duplicate_pct']}%): dropped before training.")
+
+    # Near-constant column detection — adapted from EDA notebook
+    near_const = detect_near_constant(X)
+    profile["near_constant_cols"] = near_const
+    if near_const:
+        notes.append(f"Near-constant columns ({len(near_const)}): {near_const[:5]}. Excluded from features.")
+
+    # Outlier detection (IQR method) — adapted from EDA notebook
+    outlier_cols = detect_outliers(df, numeric_cols)
+    profile["outlier_cols"] = outlier_cols
+    if outlier_cols:
+        notes.append(f"Outliers detected (>5% IQR) in: {outlier_cols[:5]}. Consider robust scaling.")
+
     profile["notes"] = notes
 
     # Class balance if classification

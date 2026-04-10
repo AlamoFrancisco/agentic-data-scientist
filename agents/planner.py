@@ -88,6 +88,11 @@ def create_plan(
     if memory_hint and memory_hint.get("best_model"):
         plan.append(f"prioritize_model:{memory_hint['best_model']}")
     
+    # Add outlier handling step if the profiler detected outlier-heavy columns
+    outlier_cols = dataset_profile.get("outlier_cols", [])
+    if outlier_cols:
+        plan.insert(plan.index("build_preprocessor"), "handle_outliers")
+
     # TODO: Add logic based on missing data
     missing_pct = dataset_profile.get("missing_pct", {})
     if missing_pct:

@@ -68,8 +68,13 @@ class AgenticDataScientist:
     def load_data(self, path: str) -> pd.DataFrame:
         """Load a CSV into a pandas DataFrame and log its shape."""
         self.log(f"Loading dataset: {path}")
-        df = pd.read_csv(path)
+        df = pd.read_csv(path, na_values=["?", "NA", "N/A", "NULL", ""])
         self.log(f"Loaded {df.shape[0]} rows × {df.shape[1]} cols")
+        before = len(df)
+        df = df.drop_duplicates()
+        dropped = before - len(df)
+        if dropped:
+            self.log(f"Dropped {dropped} duplicate rows ({dropped/before*100:.1f}%)")
         return df
 
     def run(
