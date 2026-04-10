@@ -1,3 +1,4 @@
+import hashlib
 from typing import Any, Dict, List, Optional
 import pandas as pd
 
@@ -87,12 +88,12 @@ def is_classification_target(series: pd.Series) -> bool:
 
 
 
-def dataset_fingerprint(df: pd.DataFrame, target: str) -> str:
+def dataset_fingerprint(df: pd.DataFrame, target: str, file_path: str = "") -> str:
+    # Stable hash using filename + target + column names
+    # Row count excluded — changes after deduplication
     cols = ",".join(df.columns.astype(str).tolist())
-    shape = f"{df.shape[0]}x{df.shape[1]}"
-    base = f"{shape}|{target}|{cols}"
-    h = abs(hash(base)) % (10**12)
-    return f"fp_{h}"
+    base = f"{file_path}|{target}|{cols}"
+    return "fp_" + hashlib.md5(base.encode()).hexdigest()[:12]
 
 
 def detect_near_constant(df: pd.DataFrame, threshold: float = 0.95) -> List[str]:

@@ -109,7 +109,7 @@ class AgenticDataScientist:
         self.ctx = RunContext(
             run_id=run_id,
             started_at=now_iso(),
-            data_path=data_path,
+            data_path=os.path.basename(data_path),
             target=target,
             output_dir=output_dir,
             seed=seed,
@@ -134,7 +134,8 @@ class AgenticDataScientist:
 
         # Produce a dataset profile (EDA summary) and a fingerprint used for memory
         profile = profile_dataset(df, self.ctx.target)
-        fp = dataset_fingerprint(self._raw_df, self.ctx.target)
+        profile["dataset"] = self.ctx.data_path
+        fp = dataset_fingerprint(self._raw_df, self.ctx.target, file_path=self.ctx.data_path)
 
         # Look up previous runs for the same dataset fingerprint (memory hint)
         prev = self.memory.get_dataset_record(fp)
@@ -230,6 +231,7 @@ class AgenticDataScientist:
             # Update the memory store with outcomes from this run
             self.memory.upsert_dataset_record(fp, {
                 "last_seen": now_iso(),
+                "dataset": self.ctx.data_path,
                 "target": self.ctx.target,
                 "shape": profile["shape"],
                 "best_model": eval_payload["best_metrics"]["model"],
