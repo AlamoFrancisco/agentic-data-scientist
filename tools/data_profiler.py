@@ -2,31 +2,85 @@ from typing import Any, Dict, Optional
 import pandas as pd
 
 
+def infer_schema(df: pd.DataFrame, cat_max_unique: int = 20) -> Dict[str, str]:
+    """
+    Classify each column as numeric, categorical, boolean, datetime, text, or all_missing.
+    Adapted from EDA notebook infer_schema() function.
+    """
+    out = {}
+    for col in df.columns:
+        s = df[col]
+        kind = s.dtype.kind
+        if s.isna().all():
+            out[col] = "all_missing"
+        elif kind in "ifc":   # int, float, complex
+            out[col] = "numeric"
+        elif kind == "M":     # datetime
+            out[col] = "datetime"
+        elif kind == "b":     # boolean
+            out[col] = "boolean"
+        else:
+            n_unique = s.dropna().nunique()
+            out[col] = "categorical" if n_unique <= cat_max_unique else "text"
+    return out
+
+
 def infer_target_column(df: pd.DataFrame) -> Optional[str]:
     """
-    Heuristic target inference:
+    Heuristic target inference — adapted from EDA notebook infer_target_column().
       - prefer common target-like column names
       - else last column if it has relatively low cardinality
+      - fallback: pick numeric column with lowest cardinality
     """
+    schema = infer_schema(df)
+    nunique = {c: int(df[c].nunique(dropna=True)) for c in df.columns}
+    n = len(df)
+
+    # Step 1: check for common target names
     candidates = ["target", "label", "class", "y", "outcome"]
     lower_map = {c.lower(): c for c in df.columns}
     for k in candidates:
         if k in lower_map:
             return lower_map[k]
 
+    # Step 2: check last column
     last = df.columns[-1]
-    uniq = df[last].nunique(dropna=True)
-    n = len(df)
-    if n > 0 and (uniq <= 50 or (uniq / max(n, 1) < 0.05)):
+    uniq = nunique[last]
+
+    # Skip if almost all values are unique — likely an ID
+    if n > 0 and (uniq / n) > 0.9:
+        pass
+    # Skip text columns
+    elif schema.get(last) == "text":
+        pass
+    else:
         return last
+
+    # Step 3: fallback — adapted from EDA: pick numeric column with lowest cardinality
+    numeric_cols = [c for c, t in schema.items() if t == "numeric"]
+    if numeric_cols:
+        return min(numeric_cols, key=lambda c: nunique.get(c, float("inf")))
+
     return None
 
 
 def is_classification_target(series: pd.Series) -> bool:
+    # String or category columns are always classification
     if series.dtype == "object" or str(series.dtype).startswith("category"):
         return True
+    
+    # Float columns are continuous — regression, not classification
+    if series.dtype == "float64":
+        return False
+    
+    # Integer columns with few unique values are classification
     uniq = series.nunique(dropna=True)
+    n = len(series)
+    if n > 0 and (uniq / n) <= 0.05:
+        return True
+    
     return uniq <= 50
+
 
 
 def dataset_fingerprint(df: pd.DataFrame, target: str) -> str:
@@ -43,6 +97,9 @@ def profile_dataset(df: pd.DataFrame, target: str) -> Dict[str, Any]:
 
     y = df[target]
     profile: Dict[str, Any] = {}
+
+    # Store schema — adapted from EDA notebook
+    profile["schema"] = infer_schema(df)
 
     profile["shape"] = {"rows": int(df.shape[0]), "cols": int(df.shape[1])}
     profile["columns"] = df.columns.astype(str).tolist()
@@ -83,6 +140,6 @@ def profile_dataset(df: pd.DataFrame, target: str) -> Dict[str, Any]:
     else:
         profile["class_counts"] = None
         profile["imbalance_ratio"] = None
-        profile["notes"].append("Non-classification target detected: this template focuses on classification.")
+        profile["notes"].append("Regression target detected: using regression models and metrics.")
 
     return profile

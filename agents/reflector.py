@@ -49,20 +49,50 @@ def reflect(
     """
     
     best_model = evaluation.get("model")
+    is_classification = dataset_profile.get("is_classification", True)
     bal_acc = float(evaluation.get("balanced_accuracy", 0.0))
     f1_macro = float(evaluation.get("f1_macro", 0.0))
+    r2 = float(evaluation.get("r2", 0.0))
     imb = float(dataset_profile.get("imbalance_ratio") or 1.0)
-    
+
     issues: List[str] = []
     suggestions: List[str] = []
-    
+
+    # Route to regression or classification analysis
+    if not is_classification:
+        # Regression analysis
+        dummy = next((m for m in all_metrics if "Dummy" in m.get("model", "")), None)
+        if dummy is not None:
+            dummy_r2 = float(dummy.get("r2", 0.0))
+            improvement = r2 - dummy_r2
+            if improvement < 0.05:
+                issues.append(
+                    f"Best model R² only {improvement:.3f} better than baseline. "
+                    "Weak signal or pipeline issues."
+                )
+                suggestions.append(
+                    "Check for target leakage, verify target quality, "
+                    "or improve feature engineering."
+                )
+        if r2 < 0.1:
+            issues.append(f"R² is very low ({r2:.3f}) — model explains little variance.")
+            suggestions.append("Try feature engineering or check if target is predictable.")
+        return {
+            "status": "needs_attention" if issues else "ok",
+            "best_model": best_model,
+            "issues": issues,
+            "suggestions": suggestions,
+            "replan_recommended": bool(issues),
+        }
+
+    # Classification analysis below
     # Basic comparison with dummy baseline
     dummy = next((m for m in all_metrics if "Dummy" in m.get("model", "")), None)
-    
+
     if dummy is not None:
         dummy_ba = float(dummy.get("balanced_accuracy", 0.0))
         improvement = bal_acc - dummy_ba
-        
+
         # TODO: Make this more sophisticated
         # Consider: confidence intervals, effect sizes, etc.
         if improvement < 0.05:
@@ -76,6 +106,12 @@ def reflect(
             )
     
     # TODO: Add more sophisticated checks
+    # Check for overfitting 
+    if bal_acc > 0.90 and f1_macro < 0.70:
+        issues.append("High balanced accuracy but low F1 macro suggests overfitting.")
+        suggestions.append(
+            "Try regularization, reduce model complexity, or add more data."
+        )
     
     # Check F1 score
     # TODO: Make threshold adaptive based on problem difficulty
@@ -95,6 +131,16 @@ def reflect(
     
     # TODO: Add checks for:
     # - Model diversity (are all models performing similarly?)
+    # Check for model diversity
+    f1_scores = [m.get("f1_macro", 0.0) for m in all_metrics]
+    if len(f1_scores) > 1:
+        score_range = max(f1_scores) - min(f1_scores)
+        if score_range < 0.05:
+            issues.append("All models performing similarly — low model diversity.")
+            suggestions.append(
+                "Try more diverse models or investigate data/preprocessing issues."
+            )
+
     # - Per-class performance (which classes are problematic?)
     # - Precision-recall tradeoff
     # - High-cardinality categorical features
@@ -129,7 +175,21 @@ def should_replan(reflection: Dict[str, Any]) -> bool:
     - Use memory to avoid repeating failed strategies
     - Set adaptive thresholds based on problem difficulty
     """
-    return bool(reflection.get("replan_recommended", False))
+    # Replan if explicitly recommended
+    if reflection.get("replan_recommended", False):
+        return True
+    
+    # Replan if multiple issues found
+    if len(reflection.get("issues", [])) >= 2:
+        return True
+    
+    # Replan if status is bad and there are suggestions to try
+    if reflection.get("status") == "needs_attention" and reflection.get("suggestions"):
+        return True
+    
+    # No reason to replan
+    return False
+
 
 
 def apply_replan_strategy(
@@ -164,21 +224,38 @@ def apply_replan_strategy(
     new_profile = dict(dataset_profile)
     
     # Basic strategy: add a note
-    # TODO: Implement actual strategy changes
     notes = list(new_profile.get("notes", []))
     notes.append("Replan: adjusting strategy after reflection.")
     new_profile["notes"] = notes
     
-    new_plan.append("replan_attempt")
+    # Get issues from reflection to decide strategy
+    issues = reflection.get("issues", [])
     
     # TODO: Implement sophisticated replan strategies:
-    # - If low performance: try ensemble methods
-    # - If imbalance issues: add SMOTE or adjust thresholds
-    # - If overfitting: add regularization
-    # - If underfitting: increase model complexity
-    # - If feature issues: add feature engineering steps
+    # If overfitting detected: add regularization
+    if any("overfitting" in issue for issue in issues):
+        if "apply_regularization" not in new_plan:
+            new_plan.insert(new_plan.index("train_models"), "apply_regularization")
+    
+    # If imbalance issues: add SMOTE or adjust thresholds
+    if any("imbalance" in issue.lower() for issue in issues):
+        if "consider_imbalance_strategy" not in new_plan:
+            new_plan.insert(new_plan.index("train_models"), "consider_imbalance_strategy")
+    
+    # If low performance: try ensemble methods
+    if any("F1" in issue for issue in issues):
+        if "try_ensemble_methods" not in new_plan:
+            new_plan.append("try_ensemble_methods")
+    
+    # If weak baseline: add feature engineering
+    if any("baseline" in issue for issue in issues):
+        if "apply_feature_engineering" not in new_plan:
+            new_plan.insert(new_plan.index("build_preprocessor"), "apply_feature_engineering")
+    
+    new_plan.append("replan_attempt")
     
     return new_plan, new_profile
+
 
 
 # TODO: Add helper functions for reflection

@@ -78,20 +78,25 @@ def create_plan(
         plan.append("apply_regularization")
     
     # TODO: Add logic for high-cardinality categoricals
-    high_card_cats = [c for c in categorical_cols if n_unique[c] > 50]
-    # if high_card_cats:
-    #     plan.insert(..., "apply_target_encoding")
-    
+    categorical_cols = dataset_profile.get("feature_types", {}).get("categorical", [])
+    n_unique = dataset_profile.get("n_unique_by_col", {})
+    high_card_cats = [c for c in categorical_cols if n_unique.get(c, 0) > 50]
+    if high_card_cats:
+        plan.insert(plan.index("build_preprocessor"), "apply_target_encoding")
+
     # TODO: Use memory hints
-    # if memory_hint and memory_hint.get("best_model"):
-    #     plan.append(f"prioritize_model:{memory_hint['best_model']}")
+    if memory_hint and memory_hint.get("best_model"):
+        plan.append(f"prioritize_model:{memory_hint['best_model']}")
     
     # TODO: Add logic based on missing data
-    # max_missing = max(dataset_profile["missing_pct"].values())
-    # if max_missing > 20:
-    #     plan.insert(..., "handle_severe_missing_data")
+    missing_pct = dataset_profile.get("missing_pct", {})
+    if missing_pct:
+        max_missing = max(missing_pct.values())
+        if max_missing > 20:
+            plan.insert(plan.index("build_preprocessor"), "handle_severe_missing_data")
     
     return plan
+
 
 
 # TODO: Add helper functions for planning

@@ -39,21 +39,24 @@ def plot_confusion_matrix(cm: np.ndarray, labels: List[str], out_path: str, titl
     plt.close()
 
 
-def evaluate_best(training_payload: Dict[str, Any], output_dir: str) -> Dict[str, Any]:
+def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classification: bool = True) -> Dict[str, Any]:
     best = training_payload["best"]
     all_metrics = training_payload["all_metrics"]
 
     y_test = best["y_test"]
     y_pred = best["y_pred"]
 
-    # Confusion matrix
-    cm = confusion_matrix(y_test, y_pred)
-    labels = sorted([str(x) for x in y_test.dropna().unique().tolist()])
-    cm_path = os.path.join(output_dir, "confusion_matrix.png")
-    plot_confusion_matrix(cm, labels, cm_path, f"Confusion Matrix: {best['name']}")
-
-    # Classification report
-    cls_report = classification_report(y_test, y_pred, zero_division=0)
+    if is_classification:
+        # Confusion matrix — classification only
+        cm = confusion_matrix(y_test, y_pred)
+        labels = sorted([str(x) for x in y_test.dropna().unique().tolist()])
+        cm_path = os.path.join(output_dir, "confusion_matrix.png")
+        plot_confusion_matrix(cm, labels, cm_path, f"Confusion Matrix: {best['name']}")
+        cls_report = classification_report(y_test, y_pred, zero_division=0)
+    else:
+        # Regression — no confusion matrix
+        cm_path = None
+        cls_report = None
 
     return {
         "best_metrics": best["metrics"],
@@ -81,6 +84,18 @@ def write_markdown_report(
     categorical = dataset_profile.get("feature_types", {}).get("categorical", [])
     notes = dataset_profile.get("notes", [])
 
+    # Build metrics section based on task type
+    if dataset_profile.get("is_classification"):
+        metrics_section = f"""- Accuracy: **{best.get("accuracy", 0):.3f}**
+- Balanced accuracy: **{best.get("balanced_accuracy", 0):.3f}**
+- Macro F1: **{best.get("f1_macro", 0):.3f}**
+- Macro Precision: **{best.get("precision_macro", 0):.3f}**
+- Macro Recall: **{best.get("recall_macro", 0):.3f}**"""
+    else:
+        metrics_section = f"""- R²: **{best.get("r2", 0):.3f}**
+- MAE: **{best.get("mae", 0):.3f}**
+- RMSE: **{best.get("rmse", 0):.3f}**"""
+
     md = f"""# Agentic Data Scientist Report
 
 **Run ID:** `{ctx.run_id}`  
@@ -92,7 +107,7 @@ def write_markdown_report(
 ## Dataset Profile
 - Rows: **{dataset_profile["shape"]["rows"]}**
 - Columns: **{dataset_profile["shape"]["cols"]}**
-- Classification: **{dataset_profile.get("is_classification")}**
+- Task type: **{"classification" if dataset_profile.get("is_classification") else "regression"}**
 - Imbalance ratio: **{dataset_profile.get("imbalance_ratio")}**
 
 **Feature Types**
@@ -108,11 +123,7 @@ def write_markdown_report(
 ## Results (Best Model)
 **Model:** `{best.get("model")}`
 
-- Accuracy: **{best.get("accuracy"):.3f}**
-- Balanced accuracy: **{best.get("balanced_accuracy"):.3f}**
-- Macro F1: **{best.get("f1_macro"):.3f}**
-- Macro Precision: **{best.get("precision_macro"):.3f}**
-- Macro Recall: **{best.get("recall_macro"):.3f}**
+{metrics_section}
 
 Top metrics (all candidates):
 ```json

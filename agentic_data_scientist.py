@@ -14,7 +14,7 @@ import pandas as pd
 from agents.planner import create_plan
 from agents.reflector import reflect, should_replan, apply_replan_strategy
 from agents.memory import JSONMemory
-from tools.data_profiler import profile_dataset, infer_target_column, dataset_fingerprint
+from tools.data_profiler import profile_dataset, infer_target_column, dataset_fingerprint, is_classification_target
 from tools.modelling import build_preprocessor, select_models, train_models
 from tools.evaluation import evaluate_best, write_markdown_report, save_json
 
@@ -121,8 +121,9 @@ class AgenticDataScientist:
             if not inferred:
                 raise ValueError("Could not infer target column. Please provide --target <name>.")
             # Update context with inferred target name
+            target_type = "classification" if is_classification_target(df[inferred]) else "regression"
             self.ctx.target = inferred
-            self.log(f"Inferred target: {inferred}")
+            self.log(f"Inferred target: {inferred} (type: {target_type})")
 
         # Produce a dataset profile (EDA summary) and a fingerprint used for memory
         profile = profile_dataset(df, self.ctx.target)
@@ -139,26 +140,61 @@ class AgenticDataScientist:
 
         # Execution loop: trains and evaluates, then optionally replans and repeats
         while True:
+            # Conditional execution based on plan
+            if "consider_imbalance_strategy" in plan:
+                self.log("Plan includes imbalance strategy — will use class weights.")
+                profile["use_class_weights"] = True
+
+            if "apply_regularization" in plan:
+                self.log("Plan includes regularization — small dataset detected.")
+                profile["use_regularization"] = True
+
+            if "handle_severe_missing_data" in plan:
+                self.log("Plan includes missing data handling — applying robust imputation.")
+                profile["robust_imputation"] = True
+
+            if "apply_target_encoding" in plan:
+                self.log("Plan includes target encoding — high cardinality categorical detected.")
+                profile["use_target_encoding"] = True
+
+            if "apply_feature_engineering" in plan:
+                self.log("Plan includes feature engineering — adding derived features.")
+                profile["use_feature_engineering"] = True
+
             # Build preprocessing pipeline tailored to the profile
+            self.log("Building preprocessor...")
             preprocessor = build_preprocessor(profile)
             # Choose candidate models to try based on the profile
+            self.log("Selecting candidate models...")
             candidates = select_models(profile, seed=self.ctx.seed)
             self.log(f"Candidate models: {[n for n, _ in candidates]}")
 
             # Train candidate models and persist intermediate artefacts
-            results = train_models(
-                df=df,
-                target=self.ctx.target,
-                preprocessor=preprocessor,
-                candidates=candidates,
-                seed=self.ctx.seed,
-                test_size=self.ctx.test_size,
-                output_dir=self.ctx.output_dir,
-                verbose=self.verbose,
-            )
+            self.log("Training models...")
+            
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    results = train_models(
+                        df=df,
+                        target=self.ctx.target,
+                        preprocessor=preprocessor,
+                        candidates=candidates,
+                        seed=self.ctx.seed,
+                        test_size=self.ctx.test_size,
+                        output_dir=self.ctx.output_dir,
+                        verbose=self.verbose,
+                        is_classification=profile.get("is_classification", True),
+                    )
+                    break  # Exit retry loop if training succeeded
+                except Exception as e:
+                    self.log(f"Training attempt {attempt + 1} failed with error: {e}")
+                    if attempt + 1 == max_retries:
+                        self.log("Max training attempts reached. Aborting run.")
+                        return self.ctx.output_dir
 
             # Evaluate the trained models and pick the best one
-            eval_payload = evaluate_best(results, output_dir=self.ctx.output_dir)
+            eval_payload = evaluate_best(results, output_dir=self.ctx.output_dir, is_classification=profile.get("is_classification", True))
 
             # Reflect on the evaluation in the context of the dataset profile
             reflection = reflect(

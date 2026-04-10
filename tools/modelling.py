@@ -1,6 +1,8 @@
+import profile
 from typing import Any, Dict, List, Tuple
 
 import os
+from numpy.random import seed
 import pandas as pd
 import numpy as np
 
@@ -10,10 +12,18 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
 
+# Classification models and metrics
 from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.svm import SVC
+
+# Regression models and metrics 
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.dummy import DummyRegressor
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+
 
 from sklearn.metrics import (
     accuracy_score,
@@ -28,6 +38,14 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     num_cols = profile["feature_types"]["numeric"]
     cat_cols = profile["feature_types"]["categorical"]
 
+    # Drop high cardinality categoricals
+    n_unique = profile.get("n_unique_by_col", {})
+    rows = profile["shape"]["rows"]
+    cat_cols = [
+        c for c in cat_cols 
+        if n_unique.get(c, 0) < 50 and (n_unique.get(c, 0) / max(rows, 1)) < 0.05
+    ]
+    
     numeric_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler(with_mean=True)),
@@ -52,12 +70,20 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
         remainder="drop",
     )
 
-
 def select_models(profile: Dict[str, Any], seed: int = 42) -> List[Tuple[str, Any]]:
     rows = profile["shape"]["rows"]
     cols = profile["shape"]["cols"]
     imb = float(profile.get("imbalance_ratio") or 1.0)
     class_weight = "balanced" if imb >= 3.0 else None
+    
+    # Regression models if not a classification task
+    if not profile.get("is_classification", True):
+        return [
+            ("DummyMean", DummyRegressor(strategy="mean")),
+            ("LinearRegression", LinearRegression()),
+            ("RandomForestRegressor", RandomForestRegressor(n_estimators=300, random_state=seed, n_jobs=-1)),
+            ("GradientBoostingRegressor", GradientBoostingRegressor(random_state=seed)),
+        ]
 
     candidates: List[Tuple[str, Any]] = [
         ("DummyMostFrequent", DummyClassifier(strategy="most_frequent")),
@@ -86,6 +112,7 @@ def train_models(
     test_size: float,
     output_dir: str,
     verbose: bool = True,
+    is_classification: bool = True,
 ) -> Dict[str, Any]:
     if target not in df.columns:
         raise ValueError(f"Target '{target}' not found.")
@@ -119,14 +146,22 @@ def train_models(
 
         y_pred = pipe.predict(X_test)
 
-        metrics = {
-            "model": name,
-            "accuracy": float(accuracy_score(y_test, y_pred)),
-            "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
-            "f1_macro": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
-            "precision_macro": float(precision_score(y_test, y_pred, average="macro", zero_division=0)),
-            "recall_macro": float(recall_score(y_test, y_pred, average="macro", zero_division=0)),
-        }
+        if is_classification:
+            metrics = {
+                "model": name,
+                "accuracy": float(accuracy_score(y_test, y_pred)),
+                "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
+                "f1_macro": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
+                "precision_macro": float(precision_score(y_test, y_pred, average="macro", zero_division=0)),
+                "recall_macro": float(recall_score(y_test, y_pred, average="macro", zero_division=0)),
+            }
+        else:
+            metrics = {
+                "model": name,
+                "r2": float(r2_score(y_test, y_pred)),
+                "mae": float(mean_absolute_error(y_test, y_pred)),
+                "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
+            }
 
         results.append({
             "name": name,
@@ -137,8 +172,11 @@ def train_models(
             "y_pred": y_pred,
         })
 
-    # Sort by balanced accuracy then macro F1
-    results.sort(key=lambda r: (r["metrics"]["balanced_accuracy"], r["metrics"]["f1_macro"]), reverse=True)
+    # Sort by appropriate metric — R² for regression, balanced accuracy + F1 for classification
+    if is_classification:
+        results.sort(key=lambda r: (r["metrics"]["balanced_accuracy"], r["metrics"]["f1_macro"]), reverse=True)
+    else:
+        results.sort(key=lambda r: r["metrics"]["r2"], reverse=True)
 
     return {
         "results": results,
