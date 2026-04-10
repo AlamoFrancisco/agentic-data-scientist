@@ -74,11 +74,11 @@ def create_plan(
         plan.insert(plan.index("train_models"), "consider_imbalance_strategy")
     
     # TODO: Add logic for small datasets
-    # if dataset_profile["shape"]["rows"] < 1000:
-    #     plan.append("apply_regularization")
+    if dataset_profile["shape"]["rows"] < 1000:
+        plan.append("apply_regularization")
     
     # TODO: Add logic for high-cardinality categoricals
-    # high_card_cats = [c for c in categorical_cols if n_unique[c] > 50]
+    high_card_cats = [c for c in categorical_cols if n_unique[c] > 50]
     # if high_card_cats:
     #     plan.insert(..., "apply_target_encoding")
     

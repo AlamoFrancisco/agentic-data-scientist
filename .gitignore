@@ -25,3 +25,13 @@ build/
 outputs/
 agent_memory.json
 
+# Logs
+logs/
+*.log
+
+# Claudeagent/
+
+CLAUDE.md
+
+# Data
+data/
