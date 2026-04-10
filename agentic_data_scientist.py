@@ -70,6 +70,8 @@ class AgenticDataScientist:
         self.log(f"Loading dataset: {path}")
         df = pd.read_csv(path, na_values=["?", "NA", "N/A", "NULL", ""])
         self.log(f"Loaded {df.shape[0]} rows × {df.shape[1]} cols")
+        # Store raw fingerprint before any modifications
+        self._raw_df = df.copy()
         before = len(df)
         df = df.drop_duplicates()
         dropped = before - len(df)
@@ -132,7 +134,7 @@ class AgenticDataScientist:
 
         # Produce a dataset profile (EDA summary) and a fingerprint used for memory
         profile = profile_dataset(df, self.ctx.target)
-        fp = dataset_fingerprint(df, self.ctx.target)
+        fp = dataset_fingerprint(self._raw_df, self.ctx.target)
 
         # Look up previous runs for the same dataset fingerprint (memory hint)
         prev = self.memory.get_dataset_record(fp)

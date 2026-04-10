@@ -39,6 +39,21 @@ def plot_confusion_matrix(cm: np.ndarray, labels: List[str], out_path: str, titl
     plt.close()
 
 
+def plot_predicted_vs_actual(y_test: Any, y_pred: Any, out_path: str, title: str) -> None:
+    fig, ax = plt.subplots()
+    ax.scatter(y_test, y_pred, alpha=0.5, edgecolors="none")
+    # Diagonal line — perfect predictions lie on this
+    min_val = min(float(min(y_test)), float(min(y_pred)))
+    max_val = max(float(max(y_test)), float(max(y_pred)))
+    ax.plot([min_val, max_val], [min_val, max_val], "r--", linewidth=1)
+    ax.set_xlabel("Actual")
+    ax.set_ylabel("Predicted")
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close()
+
+
 def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classification: bool = True) -> Dict[str, Any]:
     best = training_payload["best"]
     all_metrics = training_payload["all_metrics"]
@@ -54,15 +69,18 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classifi
         plot_confusion_matrix(cm, labels, cm_path, f"Confusion Matrix: {best['name']}")
         cls_report = classification_report(y_test, y_pred, zero_division=0)
     else:
-        # Regression — no confusion matrix
+        # Regression — predicted vs actual scatter plot
         cm_path = None
         cls_report = None
+        reg_plot_path = os.path.join(output_dir, "predicted_vs_actual.png")
+        plot_predicted_vs_actual(y_test, y_pred, reg_plot_path, f"Predicted vs Actual: {best['name']}")
 
     return {
         "best_metrics": best["metrics"],
         "all_metrics": all_metrics,
         "confusion_matrix_path": cm_path,
         "classification_report": cls_report,
+        "regression_plot_path": reg_plot_path if not is_classification else None,
     }
 
 
@@ -84,57 +102,107 @@ def write_markdown_report(
     categorical = dataset_profile.get("feature_types", {}).get("categorical", [])
     notes = dataset_profile.get("notes", [])
 
-    # Build metrics section based on task type
-    if dataset_profile.get("is_classification"):
-        metrics_section = f"""- Accuracy: **{best.get("accuracy", 0):.3f}**
-- Balanced accuracy: **{best.get("balanced_accuracy", 0):.3f}**
-- Macro F1: **{best.get("f1_macro", 0):.3f}**
-- Macro Precision: **{best.get("precision_macro", 0):.3f}**
-- Macro Recall: **{best.get("recall_macro", 0):.3f}**"""
+    # Plain English summary sentence
+    is_cls = dataset_profile.get("is_classification")
+    model_name = best.get("model", "Unknown")
+    if is_cls:
+        key_metric = f"balanced accuracy of {best.get('balanced_accuracy', 0):.1%} and macro F1 of {best.get('f1_macro', 0):.1%}"
     else:
-        metrics_section = f"""- R²: **{best.get("r2", 0):.3f}**
-- MAE: **{best.get("mae", 0):.3f}**
-- RMSE: **{best.get("rmse", 0):.3f}**"""
+        key_metric = f"R² of {best.get('r2', 0):.3f} (explains {best.get('r2', 0):.1%} of variance)"
+    summary = f"The best model was **{model_name}** with a {key_metric}."
 
-    md = f"""# Agentic Data Scientist Report
+    # Metrics table for best model
+    if is_cls:
+        metrics_table = f"""| Metric | Score |
+|---|---|
+| Accuracy | {best.get("accuracy", 0):.3f} |
+| Balanced Accuracy | {best.get("balanced_accuracy", 0):.3f} |
+| Macro F1 | {best.get("f1_macro", 0):.3f} |
+| Macro Precision | {best.get("precision_macro", 0):.3f} |
+| Macro Recall | {best.get("recall_macro", 0):.3f} |"""
+    else:
+        metrics_table = f"""| Metric | Score |
+|---|---|
+| R² | {best.get("r2", 0):.3f} |
+| MAE | {best.get("mae", 0):.3f} |
+| RMSE | {best.get("rmse", 0):.3f} |"""
 
-**Run ID:** `{ctx.run_id}`  
-**Started (UTC):** {ctx.started_at}  
-**Dataset:** `{ctx.data_path}`  
-**Target:** `{ctx.target}`  
-**Fingerprint:** `{fingerprint}`  
+    # All candidates table
+    all_metrics = eval_payload.get("all_metrics", [])
+    if is_cls:
+        candidates_header = "| Model | Accuracy | Balanced Acc | Macro F1 |"
+        candidates_sep    = "|---|---|---|---|"
+        candidates_rows   = "\n".join(
+            f"| {m.get('model')} | {m.get('accuracy', 0):.3f} | {m.get('balanced_accuracy', 0):.3f} | {m.get('f1_macro', 0):.3f} |"
+            for m in all_metrics
+        )
+    else:
+        candidates_header = "| Model | R² | MAE | RMSE |"
+        candidates_sep    = "|---|---|---|---|"
+        candidates_rows   = "\n".join(
+            f"| {m.get('model')} | {m.get('r2', 0):.3f} | {m.get('mae', 0):.3f} | {m.get('rmse', 0):.3f} |"
+            for m in all_metrics
+        )
+    candidates_table = f"{candidates_header}\n{candidates_sep}\n{candidates_rows}"
+
+    # Data quality summary
+    dup = dataset_profile.get("duplicate_count", 0)
+    near_const = dataset_profile.get("near_constant_cols", [])
+    outlier_cols = dataset_profile.get("outlier_cols", [])
+    quality_lines = []
+    if dup > 0:
+        quality_lines.append(f"- **{dup}** duplicate rows removed before training.")
+    if near_const:
+        quality_lines.append(f"- **{len(near_const)}** near-constant column(s) excluded: `{'`, `'.join(near_const[:5])}`")
+    if outlier_cols:
+        quality_lines.append(f"- Outlier-heavy columns (>5% IQR): `{'`, `'.join(outlier_cols[:5])}`")
+    if not quality_lines:
+        quality_lines.append("- No data quality issues detected.")
+    quality_section = "\n".join(quality_lines)
+
+    md = f"""# _Agentic Data Scientist Report_
+    
+**Author:** Francisco Antonio Alamo Rios  
+**Registration number:** 2508983
+---
+
+- **Run ID:** `{ctx.run_id}`
+- **Started (UTC):** {ctx.started_at}
+- **Dataset:** `{ctx.data_path}`
+- **Target:** `{ctx.target}`
+- **Fingerprint:** `{fingerprint}`
+
+## Summary
+{summary}
 
 ## Dataset Profile
-- Rows: **{dataset_profile["shape"]["rows"]}**
-- Columns: **{dataset_profile["shape"]["cols"]}**
-- Task type: **{"classification" if dataset_profile.get("is_classification") else "regression"}**
-- Imbalance ratio: **{dataset_profile.get("imbalance_ratio")}**
+| Property | Value |
+|---|---|
+| Rows | {dataset_profile["shape"]["rows"]} |
+| Columns | {dataset_profile["shape"]["cols"]} |
+| Task type | {"Classification" if is_cls else "Regression"} |
+| Imbalance ratio | {dataset_profile.get("imbalance_ratio") or "N/A"} |
 
-**Feature Types**
-- Numeric ({len(numeric)}): {short_list(numeric)}
-- Categorical ({len(categorical)}): {short_list(categorical)}
+**Features:** {len(numeric)} numeric ({short_list(numeric)}), {len(categorical)} categorical ({short_list(categorical)})
 
-**Notes**
-{chr(10).join([f"- {n}" for n in notes]) if notes else "- (none)"}
+## Data Quality
+{quality_section}
 
 ## Plan
-{chr(10).join([f"- {t}" for t in plan])}
+{chr(10).join([f"{i+1}. `{t}`" for i, t in enumerate(plan)])}
 
 ## Results (Best Model)
-**Model:** `{best.get("model")}`
+{metrics_table}
 
-{metrics_section}
-
-Top metrics (all candidates):
-```json
-{json.dumps(eval_payload.get("all_metrics", []), indent=2)}
-```
+### All Candidates
+{candidates_table}
 
 ## Reflection
-{chr(10).join([f"- {s}" for s in reflection.get("suggestions", [])]) if reflection else "- (none)"}
+{chr(10).join([f"- {s}" for s in reflection.get("suggestions", [])]) if reflection and reflection.get("suggestions") else "- No issues detected — results look good."}
 
-# Artefacts
-- Confusion matrix: {eval_payload.get("confusion_matrix_path")}
+## Artefacts
+{f"![Confusion Matrix](confusion_matrix.png)" if eval_payload.get("confusion_matrix_path") else ""}
+{f"![Predicted vs Actual](predicted_vs_actual.png)" if eval_payload.get("regression_plot_path") else ""}
 
 """
 

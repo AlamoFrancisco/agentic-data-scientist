@@ -48,7 +48,7 @@ def infer_target_column(df: pd.DataFrame) -> Optional[str]:
     uniq = nunique[last]
 
     # Skip if almost all values are unique — likely an ID (true IDs are ~100% unique)
-    if n > 0 and (uniq / n) > 0.99:
+    if n > 0 and (uniq / n) > 0.95:
         pass
     # Skip text columns
     elif schema.get(last) == "text":
@@ -69,8 +69,12 @@ def is_classification_target(series: pd.Series) -> bool:
     if series.dtype == "object" or str(series.dtype).startswith("category"):
         return True
     
-    # Float columns are continuous — regression, not classification
+    # Float columns are usually continuous — but if all values are whole numbers
+    # and cardinality is low, they are likely class labels stored as floats
     if series.dtype == "float64":
+        non_null = series.dropna()
+        if len(non_null) > 0 and (non_null % 1 == 0).all() and non_null.nunique() <= 20:
+            return True
         return False
     
     # Integer columns with few unique values are classification

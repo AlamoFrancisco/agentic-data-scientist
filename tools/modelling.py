@@ -43,9 +43,20 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     num_cols = [c for c in num_cols if c not in near_const]
     cat_cols = [c for c in cat_cols if c not in near_const]
 
+    # Drop columns with too many missing values — threshold adapts to dataset size
+    rows = profile["shape"]["rows"]
+    if rows < 1000:
+        missing_threshold = 60.0   # small dataset: keep more columns
+    elif rows < 10000:
+        missing_threshold = 50.0   # medium dataset
+    else:
+        missing_threshold = 40.0   # large dataset: stricter
+    missing_pct = profile.get("missing_pct", {})
+    num_cols = [c for c in num_cols if missing_pct.get(c, 0) <= missing_threshold]
+    cat_cols = [c for c in cat_cols if missing_pct.get(c, 0) <= missing_threshold]
+
     # Drop high cardinality categoricals
     n_unique = profile.get("n_unique_by_col", {})
-    rows = profile["shape"]["rows"]
     cat_cols = [
         c for c in cat_cols 
         if n_unique.get(c, 0) < 50 and (n_unique.get(c, 0) / max(rows, 1)) < 0.05
