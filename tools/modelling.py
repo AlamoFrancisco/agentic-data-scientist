@@ -1,5 +1,5 @@
 import profile
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import os
 from numpy.random import seed
@@ -35,13 +35,20 @@ from sklearn.metrics import (
 
 
 def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
-    num_cols = profile["feature_types"]["numeric"]
-    cat_cols = profile["feature_types"]["categorical"]
+    numeric_groups = profile["feature_types"]["numeric"]
+    categorical_groups = profile["feature_types"]["categorical"]
+
+    ord_cols = numeric_groups.get("ordinal", [])
+    cont_cols = numeric_groups.get("continuous", [])
+    bin_cat_cols = categorical_groups.get("binary", [])
+    multi_cat_cols = categorical_groups.get("multiclass", [])
 
     # Drop near-constant columns — they carry no signal and hurt one-hot encoding
     near_const = profile.get("near_constant_cols", [])
-    num_cols = [c for c in num_cols if c not in near_const]
-    cat_cols = [c for c in cat_cols if c not in near_const]
+    ord_cols = [c for c in ord_cols if c not in near_const]
+    cont_cols = [c for c in cont_cols if c not in near_const]
+    bin_cat_cols = [c for c in bin_cat_cols if c not in near_const]
+    multi_cat_cols = [c for c in multi_cat_cols if c not in near_const]
 
     # Drop columns with too many missing values — threshold adapts to dataset size
     rows = profile["shape"]["rows"]
@@ -52,19 +59,25 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     else:
         missing_threshold = 40.0   # large dataset: stricter
     missing_pct = profile.get("missing_pct", {})
-    num_cols = [c for c in num_cols if missing_pct.get(c, 0) <= missing_threshold]
-    cat_cols = [c for c in cat_cols if missing_pct.get(c, 0) <= missing_threshold]
+    ord_cols = [c for c in ord_cols if missing_pct.get(c, 0) <= missing_threshold]
+    cont_cols = [c for c in cont_cols if missing_pct.get(c, 0) <= missing_threshold]
+    bin_cat_cols = [c for c in bin_cat_cols if missing_pct.get(c, 0) <= missing_threshold]
+    multi_cat_cols = [c for c in multi_cat_cols if missing_pct.get(c, 0) <= missing_threshold]
 
     # Drop high cardinality categoricals
     n_unique = profile.get("n_unique_by_col", {})
-    cat_cols = [
-        c for c in cat_cols 
+    multi_cat_cols = [
+        c for c in multi_cat_cols
         if n_unique.get(c, 0) < 50 and (n_unique.get(c, 0) / max(rows, 1)) < 0.05
     ]
     
-    numeric_transformer = Pipeline(steps=[
+    continuous_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler(with_mean=True)),
+    ])
+
+    ordinal_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
     ])
 
     # scikit-learn renamed `sparse` -> `sparse_output` (v1.2+). Support both.
@@ -80,13 +93,30 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
 
     return ColumnTransformer(
         transformers=[
-            ("num", numeric_transformer, num_cols),
-            ("cat", categorical_transformer, cat_cols),
+            ("cont", continuous_transformer, cont_cols),
+            ("ord", ordinal_transformer, ord_cols),
+            ("cat", categorical_transformer, bin_cat_cols + multi_cat_cols),
         ],
         remainder="drop",
     )
 
-def select_models(profile: Dict[str, Any], seed: int = 42) -> List[Tuple[str, Any]]:
+def prioritize_candidates(
+    candidates: List[Tuple[str, Any]],
+    preferred_model: Optional[str] = None,
+) -> List[Tuple[str, Any]]:
+    if not preferred_model:
+        return candidates
+
+    preferred = [(name, model) for name, model in candidates if name == preferred_model]
+    others = [(name, model) for name, model in candidates if name != preferred_model]
+    return preferred + others
+
+
+def select_models(
+    profile: Dict[str, Any],
+    seed: int = 42,
+    preferred_model: Optional[str] = None,
+) -> List[Tuple[str, Any]]:
     rows = profile["shape"]["rows"]
     cols = profile["shape"]["cols"]
     imb = float(profile.get("imbalance_ratio") or 1.0)
@@ -94,12 +124,13 @@ def select_models(profile: Dict[str, Any], seed: int = 42) -> List[Tuple[str, An
     
     # Regression models if not a classification task
     if not profile.get("is_classification", True):
-        return [
+        candidates = [
             ("DummyMean", DummyRegressor(strategy="mean")),
             ("LinearRegression", LinearRegression()),
             ("RandomForestRegressor", RandomForestRegressor(n_estimators=300, random_state=seed, n_jobs=-1)),
             ("GradientBoostingRegressor", GradientBoostingRegressor(random_state=seed)),
         ]
+        return prioritize_candidates(candidates, preferred_model)
 
     candidates: List[Tuple[str, Any]] = [
         ("DummyMostFrequent", DummyClassifier(strategy="most_frequent")),
@@ -116,7 +147,7 @@ def select_models(profile: Dict[str, Any], seed: int = 42) -> List[Tuple[str, An
     if rows <= 20000 and cols <= 200:
         candidates.append(("SVC_RBF", SVC(kernel="rbf", probability=True, class_weight=class_weight)))
 
-    return candidates
+    return prioritize_candidates(candidates, preferred_model)
 
 
 def train_models(

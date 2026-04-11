@@ -128,6 +128,22 @@ def reflect(
             "Imbalance detected: consider class_weight, "
             "threshold tuning, or SMOTE."
         )
+
+    # Suspiciously strong performance across multiple real models can indicate
+    # leakage, duplicate target encodings, or an overly trivial target.
+    real_models = [m for m in all_metrics if "Dummy" not in m.get("model", "")]
+    near_perfect_models = [
+        m for m in real_models
+        if float(m.get("balanced_accuracy", 0.0)) >= 0.99
+        and float(m.get("f1_macro", 0.0)) >= 0.99
+    ]
+    if len(near_perfect_models) >= 2:
+        issues.append(
+            "Near-perfect performance across multiple non-baseline models is suspicious."
+        )
+        suggestions.append(
+            "Inspect features for target proxies, leakage, or columns that deterministically map to the target."
+        )
     
     # TODO: Add checks for:
     # - Model diversity (are all models performing similarly?)

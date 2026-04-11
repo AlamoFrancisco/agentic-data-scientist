@@ -26,14 +26,17 @@ def create_plan(
     
     This is a basic implementation. Students should extend this significantly.
     
-    Args:
-        dataset_profile: Dictionary containing dataset metadata including:
-            - shape: {rows: int, cols: int}
-            - feature_types: {numeric: List[str], categorical: List[str]}
-            - imbalance_ratio: float (majority/minority class ratio)
-            - missing_pct: Dict[str, float] (missing % per column)
-            - is_classification: bool
-            - notes: List[str] (warnings/observations)
+        Args:
+            dataset_profile: Dictionary containing dataset metadata including:
+                - shape: {rows: int, cols: int}
+                - feature_types: {
+                    numeric: {ordinal: List[str], continuous: List[str]},
+                    categorical: {binary: List[str], multiclass: List[str]}
+                  }
+                - imbalance_ratio: float (majority/minority class ratio)
+                - missing_pct: Dict[str, float] (missing % per column)
+                - is_classification: bool
+                - notes: List[str] (warnings/observations)
         memory_hint: Optional dict with info from previous runs on similar datasets
     
     Returns:
@@ -78,7 +81,8 @@ def create_plan(
         plan.append("apply_regularization")
     
     # TODO: Add logic for high-cardinality categoricals
-    categorical_cols = dataset_profile.get("feature_types", {}).get("categorical", [])
+    categorical_groups = dataset_profile.get("feature_types", {}).get("categorical", {})
+    categorical_cols = categorical_groups.get("binary", []) + categorical_groups.get("multiclass", [])
     n_unique = dataset_profile.get("n_unique_by_col", {})
     high_card_cats = [c for c in categorical_cols if n_unique.get(c, 0) > 50]
     if high_card_cats:

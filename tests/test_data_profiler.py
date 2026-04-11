@@ -10,24 +10,26 @@ import pandas as pd
 import pytest
 
 from tools.data_profiler import (
+    correlation_report,
     dataset_fingerprint,
     infer_schema,
     infer_target_column,
     is_classification_target,
+    ordinal_report,
     profile_dataset,
 )
 
 
 # ── infer_schema ──────────────────────────────────────────────────────────────
 
-def test_infer_schema_int_is_numeric():
+def test_infer_schema_low_cardinality_integer_like_numeric_is_ordinal():
     df = pd.DataFrame({"a": [1, 2, 3]})
-    assert infer_schema(df)["a"] == "numeric"
+    assert infer_schema(df)["a"] == "ordinal"
 
 
-def test_infer_schema_float_is_numeric():
-    df = pd.DataFrame({"b": [1.0, 2.0, 3.0]})
-    assert infer_schema(df)["b"] == "numeric"
+def test_infer_schema_continuous_float_is_continuous():
+    df = pd.DataFrame({"b": [1.1, 2.2, 3.3]})
+    assert infer_schema(df)["b"] == "continuous"
 
 
 def test_infer_schema_all_missing():
@@ -47,10 +49,8 @@ def test_infer_schema_high_cardinality_string_is_text():
 
 def test_infer_schema_bool_is_boolean():
     df = pd.DataFrame({"flag": pd.array([True, False, True], dtype="boolean")})
-    # bool kind → "boolean"
     schema = infer_schema(df)
-    # pandas boolean dtype kind is 'b'
-    assert schema["flag"] in ("boolean", "numeric")  # either is acceptable
+    assert schema["flag"] == "boolean"
 
 
 # ── infer_target_column ───────────────────────────────────────────────────────
@@ -125,6 +125,43 @@ def test_fingerprint_differs_for_different_targets():
     assert dataset_fingerprint(df, "b") != dataset_fingerprint(df, "c")
 
 
+# ── ordinal_report ────────────────────────────────────────────────────────────
+
+def test_ordinal_report_detects_integer_like_low_cardinality_numeric_column():
+    df = pd.DataFrame(
+        {
+            "rating": [1, 2, 3, 4, 5, 1, 2, 3],
+            "price": [10.5, 10.7, 10.8, 10.9, 11.1, 11.2, 11.4, 11.5],
+        }
+    )
+    schema = infer_schema(df)
+    nunique = {c: int(df[c].nunique(dropna=True)) for c in df.columns}
+
+    result = ordinal_report(df, schema, nunique)
+
+    assert ("rating", 5, 1.0) in result
+    assert all(col != "price" for col, _, _ in result)
+
+
+def test_correlation_report_detects_high_correlation_pairs():
+    df = pd.DataFrame(
+        {
+            "a": np.arange(30),
+            "b": np.arange(30) * 2,
+            "c": np.arange(30)[::-1],
+        }
+    )
+    schema = infer_schema(df)
+
+    result = correlation_report(df, schema)
+
+    assert result["corr"] is not None
+    assert any(
+        {pair["col_a"], pair["col_b"]} == {"a", "b"} and pair["abs_corr"] == 1.0
+        for pair in result["high_corr_pairs"]
+    )
+
+
 # ── profile_dataset ───────────────────────────────────────────────────────────
 
 def test_profile_dataset_basic_shape():
@@ -157,14 +194,23 @@ def test_profile_dataset_regression_note():
 def test_profile_dataset_numeric_features_detected():
     df = pd.DataFrame({"a": [1, 2, 3, 4], "b": [5, 6, 7, 8], "target": [0, 1, 0, 1]})
     profile = profile_dataset(df, "target")
-    assert "a" in profile["feature_types"]["numeric"]
-    assert "b" in profile["feature_types"]["numeric"]
+    assert "a" in profile["feature_types"]["numeric"]["ordinal"]
+    assert "b" in profile["feature_types"]["numeric"]["ordinal"]
 
 
-def test_profile_dataset_categorical_features_detected():
-    df = pd.DataFrame({"color": ["red", "blue", "red", "green"], "target": [0, 1, 0, 1]})
+def test_profile_dataset_binary_and_multiclass_categorical_features_detected():
+    df = pd.DataFrame(
+        {
+            "color": ["red", "blue", "red", "green"],
+            "flag": ["yes", "no", "yes", "no"],
+            "is_active": pd.array([True, False, True, False], dtype="boolean"),
+            "target": [0, 1, 0, 1],
+        }
+    )
     profile = profile_dataset(df, "target")
-    assert "color" in profile["feature_types"]["categorical"]
+    assert "flag" in profile["feature_types"]["categorical"]["binary"]
+    assert "is_active" in profile["feature_types"]["categorical"]["binary"]
+    assert "color" in profile["feature_types"]["categorical"]["multiclass"]
 
 
 def test_profile_dataset_imbalance_detected():
@@ -191,3 +237,42 @@ def test_profile_dataset_missing_pct_keys_are_strings():
     df = pd.DataFrame({"a": [1, None, 3], "target": [0, 1, 0]})
     profile = profile_dataset(df, "target")
     assert all(isinstance(k, str) for k in profile["missing_pct"].keys())
+
+
+def test_profile_dataset_adds_ordinal_signals_and_note():
+    df = pd.DataFrame(
+        {
+            "bedrooms": [1, 2, 3, 2, 4, 3, 2, 1],
+            "price": [100000.5, 120000.7, 140000.2, 130000.1, 160000.4, 150000.6, 125000.3, 110000.8],
+            "target": [0, 1, 0, 1, 0, 1, 0, 1],
+        }
+    )
+
+    profile = profile_dataset(df, "target")
+
+    assert profile["has_ordinal"] is True
+    assert profile["schema"]["bedrooms"] == "ordinal"
+    assert profile["schema"]["price"] == "continuous"
+    assert "bedrooms" in profile["ordinal_cols"]
+    assert "price" in profile["continuous_cols"]
+    assert any("Ordinal-like numeric columns detected" in note for note in profile["notes"])
+
+
+def test_profile_dataset_adds_correlation_signals():
+    df = pd.DataFrame(
+        {
+            "a": np.arange(30),
+            "b": np.arange(30) * 3,
+            "target": ["A", "B"] * 15,
+        }
+    )
+
+    profile = profile_dataset(df, "target")
+
+    assert profile["correlation"] is not None
+    assert profile["high_corr_present"] is True
+    assert profile["max_abs_corr"] == 1.0
+    assert any(
+        {pair["col_a"], pair["col_b"]} == {"a", "b"}
+        for pair in profile["high_corr_pairs"]
+    )

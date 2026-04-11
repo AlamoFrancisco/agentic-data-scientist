@@ -13,7 +13,13 @@ def make_profile(**overrides):
     """Build a minimal dataset profile dict; override any field as needed."""
     base = {
         "shape": {"rows": 5000, "cols": 10},
-        "feature_types": {"numeric": ["a", "b"], "categorical": []},
+        "feature_types": {
+            "numeric": {"ordinal": [], "continuous": ["a", "b"]},
+            "categorical": {"binary": [], "multiclass": []},
+            "text": [],
+            "datetime": [],
+            "all_missing": [],
+        },
         "imbalance_ratio": 1.0,
         "missing_pct": {},
         "is_classification": True,
@@ -70,7 +76,13 @@ def test_large_dataset_no_regularization():
 
 def test_high_cardinality_categorical_adds_target_encoding():
     profile = make_profile(
-        feature_types={"numeric": [], "categorical": ["model_name"]},
+        feature_types={
+            "numeric": {"ordinal": [], "continuous": []},
+            "categorical": {"binary": [], "multiclass": ["model_name"]},
+            "text": [],
+            "datetime": [],
+            "all_missing": [],
+        },
         n_unique_by_col={"model_name": 900},
     )
     plan = create_plan(profile)
@@ -79,7 +91,13 @@ def test_high_cardinality_categorical_adds_target_encoding():
 
 def test_high_cardinality_encoding_is_before_preprocessor():
     profile = make_profile(
-        feature_types={"numeric": [], "categorical": ["model_name"]},
+        feature_types={
+            "numeric": {"ordinal": [], "continuous": []},
+            "categorical": {"binary": [], "multiclass": ["model_name"]},
+            "text": [],
+            "datetime": [],
+            "all_missing": [],
+        },
         n_unique_by_col={"model_name": 900},
     )
     plan = create_plan(profile)
@@ -88,7 +106,13 @@ def test_high_cardinality_encoding_is_before_preprocessor():
 
 def test_low_cardinality_categorical_no_target_encoding():
     profile = make_profile(
-        feature_types={"numeric": [], "categorical": ["color"]},
+        feature_types={
+            "numeric": {"ordinal": [], "continuous": []},
+            "categorical": {"binary": [], "multiclass": ["color"]},
+            "text": [],
+            "datetime": [],
+            "all_missing": [],
+        },
         n_unique_by_col={"color": 5},
     )
     plan = create_plan(profile)

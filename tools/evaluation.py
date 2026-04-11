@@ -3,7 +3,10 @@ import json
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
+import matplotlib
 import numpy as np
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from sklearn.metrics import confusion_matrix, classification_report
@@ -98,8 +101,61 @@ def write_markdown_report(
     def short_list(xs: List[str], n: int = 12) -> str:
         return ", ".join(xs[:n]) + (" ..." if len(xs) > n else "")
 
-    numeric = dataset_profile.get("feature_types", {}).get("numeric", [])
-    categorical = dataset_profile.get("feature_types", {}).get("categorical", [])
+    def feature_summary(profile: Dict[str, Any]) -> str:
+        feature_types = profile.get("feature_types", {})
+        numeric_groups = feature_types.get("numeric", {})
+        categorical_groups = feature_types.get("categorical", {})
+        if isinstance(numeric_groups, dict) or isinstance(categorical_groups, dict):
+            ordinal = numeric_groups.get("ordinal", []) if isinstance(numeric_groups, dict) else []
+            continuous = numeric_groups.get("continuous", []) if isinstance(numeric_groups, dict) else []
+            binary = categorical_groups.get("binary", []) if isinstance(categorical_groups, dict) else []
+            multiclass = categorical_groups.get("multiclass", []) if isinstance(categorical_groups, dict) else []
+            text = feature_types.get("text", [])
+            datetime_cols = feature_types.get("datetime", [])
+            all_missing = feature_types.get("all_missing", [])
+            parts = []
+            if ordinal:
+                parts.append(f"{len(ordinal)} ordinal ({short_list(ordinal)})")
+            if continuous:
+                parts.append(f"{len(continuous)} continuous ({short_list(continuous)})")
+            if binary:
+                parts.append(f"{len(binary)} binary categorical ({short_list(binary)})")
+            if multiclass:
+                parts.append(f"{len(multiclass)} multiclass categorical ({short_list(multiclass)})")
+            if text:
+                parts.append(f"{len(text)} text ({short_list(text)})")
+            if datetime_cols:
+                parts.append(f"{len(datetime_cols)} datetime ({short_list(datetime_cols)})")
+            if all_missing:
+                parts.append(f"{len(all_missing)} all-missing ({short_list(all_missing)})")
+            if parts:
+                return ", ".join(parts)
+
+        schema = profile.get("schema", {})
+        target = profile.get("target", getattr(ctx, "target", None))
+        if schema:
+            feature_schema = {col: kind for col, kind in schema.items() if col != target}
+            ordered_groups = [
+                ("ordinal", "ordinal"),
+                ("continuous", "continuous"),
+                ("categorical", "categorical"),
+                ("text", "text"),
+                ("boolean", "boolean"),
+                ("datetime", "datetime"),
+                ("all-missing", "all_missing"),
+            ]
+            parts = []
+            for label, schema_key in ordered_groups:
+                cols = [col for col, kind in feature_schema.items() if kind == schema_key]
+                if cols:
+                    parts.append(f"{len(cols)} {label} ({short_list(cols)})")
+            if parts:
+                return ", ".join(parts)
+
+        numeric = feature_types.get("numeric", [])
+        categorical = feature_types.get("categorical", [])
+        return f"{len(numeric)} numeric ({short_list(numeric)}), {len(categorical)} categorical ({short_list(categorical)})"
+
     notes = dataset_profile.get("notes", [])
 
     # Plain English summary sentence
@@ -183,7 +239,7 @@ def write_markdown_report(
 | Task type | {"Classification" if is_cls else "Regression"} |
 | Imbalance ratio | {dataset_profile.get("imbalance_ratio") or "N/A"} |
 
-**Features:** {len(numeric)} numeric ({short_list(numeric)}), {len(categorical)} categorical ({short_list(categorical)})
+**Features:** {feature_summary(dataset_profile)}
 
 ## Data Quality
 {quality_section}

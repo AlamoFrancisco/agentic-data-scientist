@@ -104,7 +104,20 @@ def _cls_profile():
         "shape": {"rows": 100, "cols": 5},
         "is_classification": True,
         "imbalance_ratio": 1.0,
-        "feature_types": {"numeric": ["a", "b"], "categorical": ["c"]},
+        "target": "label",
+        "schema": {
+            "a": "continuous",
+            "b": "ordinal",
+            "c": "categorical",
+            "label": "ordinal",
+        },
+        "feature_types": {
+            "numeric": {"ordinal": ["b"], "continuous": ["a"]},
+            "categorical": {"binary": [], "multiclass": ["c"]},
+            "text": [],
+            "datetime": [],
+            "all_missing": [],
+        },
         "notes": [],
     }
 
@@ -114,7 +127,19 @@ def _reg_profile():
         "shape": {"rows": 100, "cols": 3},
         "is_classification": False,
         "imbalance_ratio": None,
-        "feature_types": {"numeric": ["a", "b"], "categorical": []},
+        "target": "label",
+        "schema": {
+            "a": "ordinal",
+            "b": "continuous",
+            "label": "continuous",
+        },
+        "feature_types": {
+            "numeric": {"ordinal": ["a"], "continuous": ["b"]},
+            "categorical": {"binary": [], "multiclass": []},
+            "text": [],
+            "datetime": [],
+            "all_missing": [],
+        },
         "notes": ["Regression target detected."],
     }
 
@@ -162,6 +187,21 @@ def test_write_markdown_report_regression_contains_r2(tmp_path):
     )
     content = open(out).read()
     assert "R²" in content
+
+
+def test_write_markdown_report_uses_schema_feature_types(tmp_path):
+    out = str(tmp_path / "report.md")
+    payload = reg_payload()
+    eval_result = evaluate_best(payload, str(tmp_path), is_classification=False)
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_schema",
+        dataset_profile=_reg_profile(),
+        plan=["profile_dataset", "train_models"],
+        eval_payload=eval_result,
+        reflection={"suggestions": []},
+    )
+    content = open(out).read()
+    assert "1 ordinal (a), 1 continuous (b)" in content
 
 
 def test_write_markdown_report_contains_run_id(tmp_path):

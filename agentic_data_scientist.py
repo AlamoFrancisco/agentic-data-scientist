@@ -79,6 +79,14 @@ class AgenticDataScientist:
             self.log(f"Dropped {dropped} duplicate rows ({dropped/before*100:.1f}%)")
         return df
 
+    def _preferred_model_from_plan(self, plan: List[str]) -> Optional[str]:
+        """Extract a memory-driven model priority from the plan, if present."""
+        for step in plan:
+            if step.startswith("prioritize_model:"):
+                _, _, model_name = step.partition(":")
+                return model_name or None
+        return None
+
     def run(
         self,
         data_path: str,
@@ -122,18 +130,27 @@ class AgenticDataScientist:
         # Load dataset into memory
         df = self.load_data(data_path)
 
-        # If client requested auto target detection, infer it from data
+        # If client requested auto target detection, check memory first before inferring
+        target_source = "manual"
+        target_candidate_scores = None
         if target.strip().lower() == "auto":
-            inferred = infer_target_column(df)
-            if not inferred:
-                raise ValueError("Could not infer target column. Please provide --target <name>.")
-            # Update context with inferred target name
-            target_type = "classification" if is_classification_target(df[inferred]) else "regression"
-            self.ctx.target = inferred
-            self.log(f"Inferred target: {inferred} (type: {target_type})")
+            prev_hint = self.memory.get_dataset_record("", dataset_name=self.ctx.data_path)
+            if prev_hint and prev_hint.get("target"):
+                stored_target = prev_hint["target"]
+                self.ctx.target = stored_target
+                target_source = "memory"
+                self.log(f"Using target from memory: '{stored_target}'")
+            else:
+                inferred, target_candidate_scores = infer_target_column(df)
+                if not inferred:
+                    raise ValueError("Could not infer target column. Please provide --target <name>.")
+                target_type = "classification" if is_classification_target(df[inferred]) else "regression"
+                self.ctx.target = inferred
+                target_source = "inferred"
+                self.log(f"Inferred target: {inferred} (type: {target_type})")
 
         # Produce a dataset profile (EDA summary) and a fingerprint used for memory
-        profile = profile_dataset(df, self.ctx.target)
+        profile = profile_dataset(df, self.ctx.target, target_source=target_source, target_candidate_scores=target_candidate_scores)
         profile["dataset"] = self.ctx.data_path
         fp = dataset_fingerprint(self._raw_df, self.ctx.target, file_path=self.ctx.data_path)
 
@@ -179,7 +196,14 @@ class AgenticDataScientist:
             preprocessor = build_preprocessor(profile)
             # Choose candidate models to try based on the profile
             self.log("Selecting candidate models...")
-            candidates = select_models(profile, seed=self.ctx.seed)
+            preferred_model = self._preferred_model_from_plan(plan)
+            candidates = select_models(
+                profile,
+                seed=self.ctx.seed,
+                preferred_model=preferred_model,
+            )
+            if preferred_model:
+                self.log(f"Applying memory priority: {preferred_model}")
             self.log(f"Candidate models: {[n for n, _ in candidates]}")
 
             # Train candidate models and persist intermediate artefacts
@@ -239,6 +263,7 @@ class AgenticDataScientist:
                 "last_seen": now_iso(),
                 "dataset": self.ctx.data_path,
                 "target": self.ctx.target,
+                "target_source": target_source,
                 "shape": profile["shape"],
                 "best_model": eval_payload["best_metrics"]["model"],
                 "best_metrics": eval_payload["best_metrics"],

@@ -35,11 +35,22 @@ def make_reg_df(n=120):
 
 def make_profile(df, target="target", is_classification=True):
     X = df.drop(columns=[target])
+    numeric_cols = X.select_dtypes(include="number").columns.tolist()
+    categorical_cols = X.select_dtypes(exclude="number").columns.tolist()
     return {
         "shape": {"rows": len(df), "cols": len(df.columns)},
         "feature_types": {
-            "numeric":     X.select_dtypes(include="number").columns.tolist(),
-            "categorical": X.select_dtypes(exclude="number").columns.tolist(),
+            "numeric": {
+                "ordinal": [],
+                "continuous": numeric_cols,
+            },
+            "categorical": {
+                "binary": [c for c in categorical_cols if X[c].nunique(dropna=True) <= 2],
+                "multiclass": [c for c in categorical_cols if X[c].nunique(dropna=True) > 2],
+            },
+            "text": [],
+            "datetime": [],
+            "all_missing": [],
         },
         "n_unique_by_col": {c: int(df[c].nunique()) for c in df.columns},
         "imbalance_ratio": 1.0,
@@ -75,7 +86,13 @@ def test_build_preprocessor_drops_high_cardinality_categoricals():
     })
     profile = {
         "shape": {"rows": n, "cols": 4},
-        "feature_types": {"numeric": ["num"], "categorical": ["hi_cat", "lo_cat"]},
+        "feature_types": {
+            "numeric": {"ordinal": [], "continuous": ["num"]},
+            "categorical": {"binary": [], "multiclass": ["hi_cat", "lo_cat"]},
+            "text": [],
+            "datetime": [],
+            "all_missing": [],
+        },
         "n_unique_by_col": {"num": 200, "hi_cat": 200, "lo_cat": 3, "target": 2},
         "imbalance_ratio": 1.0,
         "is_classification": True,
@@ -128,6 +145,24 @@ def test_select_models_small_dataset_includes_svc():
     profile["shape"]["cols"] = 10
     names = [n for n, _ in select_models(profile)]
     assert "SVC_RBF" in names
+
+
+def test_select_models_respects_regression_priority():
+    profile = make_profile(make_reg_df(), is_classification=False)
+    names = [n for n, _ in select_models(profile, preferred_model="GradientBoostingRegressor")]
+    assert names[0] == "GradientBoostingRegressor"
+
+
+def test_select_models_respects_classification_priority():
+    profile = make_profile(make_cls_df())
+    names = [n for n, _ in select_models(profile, preferred_model="RandomForest")]
+    assert names[0] == "RandomForest"
+
+
+def test_select_models_ignores_unknown_priority():
+    profile = make_profile(make_reg_df(), is_classification=False)
+    names = [n for n, _ in select_models(profile, preferred_model="DoesNotExist")]
+    assert names[0] == "DummyMean"
 
 
 # ── train_models ─────────────────────────────────────────────────────────────

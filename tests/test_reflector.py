@@ -89,6 +89,36 @@ def test_classification_weak_baseline_adds_issue():
     assert any("baseline" in i.lower() for i in result["issues"])
 
 
+def test_classification_near_perfect_multiple_models_flags_suspicion():
+    all_m = [
+        {"model": "LogisticRegression", "balanced_accuracy": 1.00, "f1_macro": 1.00},
+        {"model": "RandomForest",       "balanced_accuracy": 1.00, "f1_macro": 1.00},
+        {"model": "DummyMostFrequent",  "balanced_accuracy": 0.33, "f1_macro": 0.20},
+    ]
+    result = reflect(
+        cls_profile(),
+        cls_eval(1.00, 1.00, model="LogisticRegression"),
+        all_m,
+    )
+    assert result["status"] == "needs_attention"
+    assert any("suspicious" in i.lower() for i in result["issues"])
+    assert any("leakage" in s.lower() or "target prox" in s.lower() for s in result["suggestions"])
+
+
+def test_classification_single_near_perfect_model_does_not_flag_suspicion():
+    all_m = [
+        {"model": "RandomForest",      "balanced_accuracy": 1.00, "f1_macro": 1.00},
+        {"model": "LogisticRegression","balanced_accuracy": 0.91, "f1_macro": 0.90},
+        {"model": "DummyMostFrequent", "balanced_accuracy": 0.50, "f1_macro": 0.25},
+    ]
+    result = reflect(
+        cls_profile(),
+        cls_eval(1.00, 1.00),
+        all_m,
+    )
+    assert not any("suspicious" in i.lower() for i in result["issues"])
+
+
 # ── reflect – regression ─────────────────────────────────────────────────────
 
 def test_regression_good_performance_is_ok():
