@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tools.modelling import build_preprocessor, select_models, train_models
+from tools.modelling import build_preprocessor, cross_validate_top_models, select_models, train_models
 
 
 # ── fixtures / helpers ────────────────────────────────────────────────────────
@@ -140,8 +140,9 @@ def test_select_models_large_dataset_excludes_gradient_boosting():
 
 
 def test_select_models_small_dataset_includes_svc():
+    # SVC is only included for small datasets (rows < 1000) with few columns (cols <= 50)
     profile = make_profile(make_cls_df())
-    profile["shape"]["rows"] = 1000
+    profile["shape"]["rows"] = 500
     profile["shape"]["cols"] = 10
     names = [n for n, _ in select_models(profile)]
     assert "SVC_RBF" in names
@@ -230,3 +231,49 @@ def test_train_models_invalid_target_raises():
     with pytest.raises(ValueError, match="not found"):
         train_models(df, "nonexistent", pp, candidates, seed=42,
                      test_size=0.2, output_dir=".")
+
+
+def test_cross_validate_top_models_classification_returns_summary():
+    df = make_cls_df()
+    profile = make_profile(df)
+    pp = build_preprocessor(profile)
+    candidates = [(n, m) for n, m in select_models(profile) if n in ("DummyMostFrequent", "LogisticRegression")]
+    trained = train_models(df, "target", pp, candidates, seed=42,
+                           test_size=0.2, output_dir=".", is_classification=True)
+
+    result = cross_validate_top_models(
+        df=df,
+        target="target",
+        training_payload=trained,
+        seed=42,
+        is_classification=True,
+        top_k=2,
+    )
+
+    assert result["enabled"] is True
+    assert result["n_splits"] >= 2
+    assert len(result["models"]) >= 1
+    assert "balanced_accuracy_mean" in result["models"][0]
+
+
+def test_cross_validate_top_models_regression_returns_summary():
+    df = make_reg_df()
+    profile = make_profile(df, is_classification=False)
+    pp = build_preprocessor(profile)
+    candidates = [(n, m) for n, m in select_models(profile) if n in ("DummyMean", "LinearRegression")]
+    trained = train_models(df, "target", pp, candidates, seed=42,
+                           test_size=0.2, output_dir=".", is_classification=False)
+
+    result = cross_validate_top_models(
+        df=df,
+        target="target",
+        training_payload=trained,
+        seed=42,
+        is_classification=False,
+        top_k=2,
+    )
+
+    assert result["enabled"] is True
+    assert result["n_splits"] >= 2
+    assert len(result["models"]) >= 1
+    assert "r2_mean" in result["models"][0]

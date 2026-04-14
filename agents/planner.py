@@ -64,6 +64,7 @@ def create_plan(
         "select_models",
         "train_models",
         "evaluate",
+        "validate_with_cross_validation",
         "reflect",
         "write_report",
     ]
@@ -76,16 +77,28 @@ def create_plan(
         # Consider: SMOTE, class weights, threshold tuning, etc.
         plan.insert(plan.index("train_models"), "consider_imbalance_strategy")
     
-    # TODO: Add logic for small datasets
-    if dataset_profile["shape"]["rows"] < 1000:
+    # Size bucket — drives model complexity and regularization
+    rows = dataset_profile["shape"]["rows"]
+    if rows < 1000:
         plan.append("apply_regularization")
+        plan.append("use_simple_models_only")
+    elif rows >= 10000:
+        plan.append("use_ensemble_models")
     
-    # TODO: Add logic for high-cardinality categoricals
+    # High-cardinality categoricals: check multiclass AND text columns.
+    # Text cols are high-cardinality strings — those with n_unique < 10% of rows
+    # are likely real categoricals (e.g. model_name, city) rather than free-form text or IDs.
     categorical_groups = dataset_profile.get("feature_types", {}).get("categorical", {})
     categorical_cols = categorical_groups.get("binary", []) + categorical_groups.get("multiclass", [])
+    text_cols = dataset_profile.get("feature_types", {}).get("text", [])
     n_unique = dataset_profile.get("n_unique_by_col", {})
     high_card_cats = [c for c in categorical_cols if n_unique.get(c, 0) > 50]
-    if high_card_cats:
+    # Text cols that look categorical: more than 50 unique values but under 10% of rows
+    high_card_text = [
+        c for c in text_cols
+        if 50 < n_unique.get(c, 0) < rows * 0.10
+    ]
+    if high_card_cats or high_card_text:
         plan.insert(plan.index("build_preprocessor"), "apply_target_encoding")
 
     # TODO: Use memory hints
@@ -103,6 +116,30 @@ def create_plan(
         max_missing = max(missing_pct.values())
         if max_missing > 20:
             plan.insert(plan.index("build_preprocessor"), "handle_severe_missing_data")
+
+    # Use robust scaling when scale mismatch detected
+    if dataset_profile.get("scale_mismatch"):
+        plan.insert(plan.index("build_preprocessor"), "apply_robust_scaling")
+
+    # Drop features with near-perfect mutual information with target — likely leaky
+    leaky_cols = [c["column"] for c in dataset_profile.get("leaky_cols", [])]
+    if leaky_cols:
+        dataset_profile["leaky_col_names"] = leaky_cols
+        plan.insert(plan.index("build_preprocessor"), "drop_leaky_features")
+
+    # Drop near-constant features — they carry no signal and inflate one-hot encoding
+    near_constant_cols = dataset_profile.get("near_constant_cols", [])
+    if near_constant_cols:
+        plan.insert(plan.index("build_preprocessor"), "drop_near_constant_features")
+
+    # Drop highly correlated features (abs_corr >= 0.95) — likely redundant or leaky
+    high_corr_pairs = dataset_profile.get("high_corr_pairs", [])
+    cols_to_drop = list({
+        p["col_b"] for p in high_corr_pairs if p.get("abs_corr", 0) >= 0.95
+    })
+    if cols_to_drop:
+        dataset_profile["corr_cols_to_drop"] = cols_to_drop
+        plan.insert(plan.index("build_preprocessor"), "drop_correlated_features")
     
     return plan
 

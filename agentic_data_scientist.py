@@ -15,8 +15,8 @@ from agents.planner import create_plan
 from agents.reflector import reflect, should_replan, apply_replan_strategy
 from agents.memory import JSONMemory
 from tools.data_profiler import profile_dataset, infer_target_column, dataset_fingerprint, is_classification_target
-from tools.modelling import build_preprocessor, select_models, train_models
-from tools.evaluation import evaluate_best, write_markdown_report, save_json
+from tools.modelling import build_preprocessor, cross_validate_top_models, select_models, train_models
+from tools.evaluation import evaluate_best, write_markdown_report, save_json, derive_run_verdict
 
 
 # Lightweight container for run metadata and parameters
@@ -70,8 +70,6 @@ class AgenticDataScientist:
         self.log(f"Loading dataset: {path}")
         df = pd.read_csv(path, na_values=["?", "NA", "N/A", "NULL", ""])
         self.log(f"Loaded {df.shape[0]} rows × {df.shape[1]} cols")
-        # Store raw fingerprint before any modifications
-        self._raw_df = df.copy()
         before = len(df)
         df = df.drop_duplicates()
         dropped = before - len(df)
@@ -134,14 +132,25 @@ class AgenticDataScientist:
         target_source = "manual"
         target_candidate_scores = None
         if target.strip().lower() == "auto":
-            prev_hint = self.memory.get_dataset_record("", dataset_name=self.ctx.data_path)
-            if prev_hint and prev_hint.get("target"):
+            prev_hint = self.memory.get_dataset_record(
+                "",
+                dataset_name=self.ctx.data_path,
+                require_reliable=True,
+            )
+            failed = self.memory.get_failed_targets(self.ctx.data_path)
+            if prev_hint and prev_hint.get("target") and prev_hint["target"] not in failed:
                 stored_target = prev_hint["target"]
                 self.ctx.target = stored_target
                 target_source = "memory"
                 self.log(f"Using target from memory: '{stored_target}'")
             else:
-                inferred, target_candidate_scores = infer_target_column(df)
+                inferred, target_candidate_scores = infer_target_column(df, return_scores=True)
+                # Skip targets that previously failed on this dataset
+                failed = self.memory.get_failed_targets(self.ctx.data_path)
+                if failed and inferred in failed:
+                    self.log(f"Skipping previously failed target '{inferred}'. Trying next candidate.")
+                    sorted_candidates = sorted(target_candidate_scores.items(), key=lambda x: x[1], reverse=True)
+                    inferred = next((c for c, _ in sorted_candidates if c not in failed), inferred)
                 if not inferred:
                     raise ValueError("Could not infer target column. Please provide --target <name>.")
                 target_type = "classification" if is_classification_target(df[inferred]) else "regression"
@@ -152,7 +161,7 @@ class AgenticDataScientist:
         # Produce a dataset profile (EDA summary) and a fingerprint used for memory
         profile = profile_dataset(df, self.ctx.target, target_source=target_source, target_candidate_scores=target_candidate_scores)
         profile["dataset"] = self.ctx.data_path
-        fp = dataset_fingerprint(self._raw_df, self.ctx.target, file_path=self.ctx.data_path)
+        fp = dataset_fingerprint(df, self.ctx.target, file_path=self.ctx.data_path)
 
         # Look up previous runs — by fingerprint, then filename, then target+shape
         prev = self.memory.get_dataset_record(
@@ -160,6 +169,7 @@ class AgenticDataScientist:
             dataset_name=self.ctx.data_path,
             target=self.ctx.target,
             shape=profile["shape"],
+            require_reliable=True,
         )
         if prev:
             self.log(f"Memory hit: previously best={prev.get('best_model')} for fp={fp}")
@@ -190,6 +200,36 @@ class AgenticDataScientist:
             if "apply_feature_engineering" in plan:
                 self.log("Plan includes feature engineering — adding derived features.")
                 profile["use_feature_engineering"] = True
+
+            if "apply_robust_scaling" in plan:
+                self.log("Plan includes robust scaling — scale mismatch detected.")
+                profile["use_robust_scaling"] = True
+
+            if "handle_outliers" in plan:
+                self.log("Plan includes outlier handling.")
+                profile["handle_outliers"] = True
+
+            if "drop_near_constant_features" in plan:
+                cols = profile.get("near_constant_cols", [])
+                self.log(f"Plan includes dropping near-constant features: {cols}")
+
+            if "drop_correlated_features" in plan:
+                cols = profile.get("corr_cols_to_drop", [])
+                self.log(f"Plan includes dropping correlated features: {cols}")
+                profile["drop_high_corr"] = True
+
+            if "drop_leaky_features" in plan:
+                cols = profile.get("leaky_col_names", [])
+                self.log(f"Plan includes dropping leaky features: {cols}")
+                profile["drop_leaky"] = True
+
+            if "use_simple_models_only" in plan:
+                self.log("Plan includes simple models only — small dataset.")
+                profile["simple_models_only"] = True
+
+            if "use_ensemble_models" in plan:
+                self.log("Plan includes ensemble models — large dataset.")
+                profile["prefer_ensemble"] = True
 
             # Build preprocessing pipeline tailored to the profile
             self.log("Building preprocessor...")
@@ -232,13 +272,43 @@ class AgenticDataScientist:
 
             # Evaluate the trained models and pick the best one
             eval_payload = evaluate_best(results, output_dir=self.ctx.output_dir, is_classification=profile.get("is_classification", True))
+            if "validate_with_cross_validation" in plan:
+                self.log("Validating top candidate models with cross-validation...")
+                cv_top_k = 2 if profile["shape"]["rows"] >= 1000 else 3
+                cv_payload = cross_validate_top_models(
+                    df=df,
+                    target=self.ctx.target,
+                    training_payload=results,
+                    seed=self.ctx.seed,
+                    is_classification=profile.get("is_classification", True),
+                    top_k=cv_top_k,
+                )
+                if cv_payload.get("enabled"):
+                    self.log(
+                        f"Cross-validation complete: {cv_payload.get('n_splits', 0)} folds "
+                        f"across {len(cv_payload.get('models', []))} model(s)."
+                    )
+                else:
+                    self.log(f"Cross-validation skipped: {cv_payload.get('reason', 'unknown reason')}")
+            else:
+                cv_payload = {
+                    "enabled": False,
+                    "reason": "Cross-validation was not requested by the plan.",
+                    "n_splits": 0,
+                    "models": [],
+                    "warnings": [],
+                }
+            eval_payload["cross_validation"] = cv_payload
 
             # Reflect on the evaluation in the context of the dataset profile
             reflection = reflect(
                 dataset_profile=profile,
                 evaluation=eval_payload["best_metrics"],
                 all_metrics=eval_payload["all_metrics"],
+                training_warnings=results.get("training_warnings", []),
+                cv_summary=cv_payload,
             )
+            verdict = derive_run_verdict(profile, eval_payload, reflection)
 
             # Persist core run artefacts for later review
             save_json(os.path.join(self.ctx.output_dir, "eda_summary.json"), profile)
@@ -258,16 +328,37 @@ class AgenticDataScientist:
             )
 
             # Update the memory store with outcomes from this run
-            # Also stored under fp_struct so renamed files still get a memory hit
-            self.memory.upsert_dataset_record(fp, {
+            # Only reliable runs are reused as successful priors; other runs are
+            # stored as diagnostics so memory does not learn the wrong lesson.
+            record = {
                 "last_seen": now_iso(),
                 "dataset": self.ctx.data_path,
                 "target": self.ctx.target,
                 "target_source": target_source,
                 "shape": profile["shape"],
-                "best_model": eval_payload["best_metrics"]["model"],
-                "best_metrics": eval_payload["best_metrics"],
-            })
+                "is_classification": profile.get("is_classification", True),
+                "verdict_label": verdict["label"],
+                "verdict_detail": verdict["detail"],
+                "reflection_status": reflection["status"],
+            }
+            if verdict["label"] == "Reliable result":
+                record["best_model"] = eval_payload["best_metrics"]["model"]
+                record["best_metrics"] = eval_payload["best_metrics"]
+            else:
+                record["diagnostic_model"] = eval_payload["best_metrics"]["model"]
+                record["diagnostic_metrics"] = eval_payload["best_metrics"]
+            if cv_payload.get("enabled"):
+                record["cross_validation"] = cv_payload
+            self.memory.upsert_dataset_record(fp, record)
+
+            # Invalid or baseline-beating failures should not be auto-reused later.
+            best_model = eval_payload["best_metrics"]["model"]
+            if verdict["label"] == "Invalid due to leakage risk":
+                self.log(f"Target '{self.ctx.target}' was flagged as invalid due to leakage risk — storing as failed.")
+                self.memory.add_failed_target(self.ctx.data_path, self.ctx.target)
+            elif reflection["status"] == "needs_attention" and "Dummy" in best_model:
+                self.log(f"Target '{self.ctx.target}' produced no useful results — storing as failed.")
+                self.memory.add_failed_target(self.ctx.data_path, self.ctx.target)
 
             # Decide whether the agent should attempt to re-plan and re-run
             if not should_replan(reflection):

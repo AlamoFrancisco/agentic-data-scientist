@@ -149,13 +149,15 @@ def test_should_replan_true_when_recommended():
     assert should_replan({"replan_recommended": True, "issues": [], "suggestions": [], "status": "ok"}) is True
 
 
-def test_should_replan_true_multiple_issues():
-    assert should_replan({"replan_recommended": False, "issues": ["a", "b"], "suggestions": [], "status": "ok"}) is True
+def test_should_replan_false_multiple_issues_without_flag():
+    # should_replan defers entirely to replan_recommended — issue count alone does not trigger
+    assert should_replan({"replan_recommended": False, "issues": ["a", "b"], "suggestions": [], "status": "ok"}) is False
 
 
-def test_should_replan_true_needs_attention_with_suggestions():
+def test_should_replan_false_needs_attention_without_flag():
+    # needs_attention status alone does not trigger replan — replan_recommended must be True
     r = {"replan_recommended": False, "issues": ["one"], "suggestions": ["try X"], "status": "needs_attention"}
-    assert should_replan(r) is True
+    assert should_replan(r) is False
 
 
 def test_should_replan_false_when_clean():

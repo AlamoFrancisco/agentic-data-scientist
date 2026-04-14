@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
 
 NUMERIC_SCHEMA_TYPES = {"ordinal", "continuous"}
 
@@ -30,6 +31,30 @@ def _infer_numeric_schema_type(
     return "continuous"
 
 
+def _is_boolean_like(series: pd.Series) -> bool:
+    non_null = series.dropna()
+    if non_null.empty:
+        return False
+
+    if pd.api.types.is_bool_dtype(non_null):
+        return True
+
+    numeric = pd.to_numeric(non_null, errors="coerce")
+    if not numeric.isna().any():
+        values = set(float(v) for v in numeric.unique().tolist())
+        if values <= {0.0, 1.0} and values:
+            return True
+
+    normalized = {str(value).strip().lower() for value in non_null.unique().tolist()}
+    boolean_pairs = (
+        {"true", "false"},
+        {"yes", "no"},
+        {"y", "n"},
+        {"t", "f"},
+    )
+    return any(normalized == pair for pair in boolean_pairs)
+
+
 def infer_schema(df: pd.DataFrame, cat_max_unique: int = 20) -> Dict[str, str]:
     """
     Classify each column as ordinal, continuous, categorical, boolean, datetime,
@@ -41,12 +66,12 @@ def infer_schema(df: pd.DataFrame, cat_max_unique: int = 20) -> Dict[str, str]:
         kind = s.dtype.kind
         if s.isna().all():
             out[col] = "all_missing"
+        elif kind == "b" or _is_boolean_like(s):     # boolean / boolean-like
+            out[col] = "boolean"
         elif kind in "ifc":   # int, float, complex
             out[col] = _infer_numeric_schema_type(s, max_unique=cat_max_unique)
         elif kind == "M":     # datetime
             out[col] = "datetime"
-        elif kind == "b":     # boolean
-            out[col] = "boolean"
         else:
             n_unique = s.dropna().nunique()
             out[col] = "categorical" if n_unique <= cat_max_unique else "text"
@@ -94,12 +119,11 @@ def _score_target_candidate(
     return score
 
 
-def infer_target_column(df: pd.DataFrame) -> tuple:
+def infer_target_column(df: pd.DataFrame, return_scores: bool = False):
     """
-    Score every column as a target candidate and return (best_column, scores_dict).
-    Signals: common target name, low cardinality, last column position.
-    Penalties: ID-like cardinality, text type, all missing.
-    Returns (None, scores) if no column scores above 0.
+    Score every column as a target candidate and return the best column name.
+    When return_scores=True, also returns the scores dict as a second value.
+    Returns None if no column scores above 0.
     """
     schema = infer_schema(df)
     nunique = {c: int(df[c].nunique(dropna=True)) for c in df.columns}
@@ -111,10 +135,11 @@ def infer_target_column(df: pd.DataFrame) -> tuple:
     }
 
     best = max(scores, key=lambda c: scores[c])
-    if scores[best] <= 0:
-        return None, scores
+    result = best if scores[best] > 0 else None
 
-    return best, scores
+    if return_scores:
+        return result, scores
+    return result
 
 
 def is_classification_target(series: pd.Series) -> bool:
@@ -288,6 +313,99 @@ def build_feature_types(
     }
 
 
+def leakage_report(
+    df: pd.DataFrame,
+    target: str,
+    schema: Dict[str, str],
+    is_classification: bool = True,
+    threshold: float = 0.9,
+) -> List[Dict[str, Any]]:
+    """
+    Detect potentially leaky features using mutual information.
+    Normalises MI by target entropy so threshold is scale-invariant.
+    Flags features where normalised MI >= threshold (default 0.9).
+    """
+    feature_cols = [c for c in df.columns if c != target]
+    y = df[target].copy()
+    X = df[feature_cols].copy()
+
+    # Encode categoricals and text as integers for mutual_info
+    for col in feature_cols:
+        if schema.get(col) in ("categorical", "text", "boolean", "all_missing"):
+            X[col] = pd.factorize(X[col])[0].astype(float)
+        X[col] = pd.to_numeric(X[col], errors="coerce")
+
+    X = X.fillna(X.median(numeric_only=True))
+
+    # Encode target — classification uses label-encoded integers;
+    # regression uses raw values so MI reflects actual continuous relationships
+    if is_classification:
+        y_encoded = pd.factorize(y)[0]
+        mi_scores = mutual_info_classif(X, y_encoded, random_state=42)
+        # Normalise by target entropy (meaningful for discrete targets)
+        vc = pd.Series(y_encoded).value_counts(normalize=True)
+        target_entropy = float(-np.sum(vc * np.log(vc + 1e-10)))
+        if target_entropy == 0:
+            return []
+        normaliser = target_entropy
+    else:
+        y_encoded = y.astype(float).values
+        mi_scores = mutual_info_regression(X, y_encoded, random_state=42)
+        # Normalise by max MI score — keeps threshold scale-invariant for regression
+        max_mi = float(np.max(mi_scores)) if np.max(mi_scores) > 0 else 1.0
+        normaliser = max_mi
+
+    leaky = []
+    for col, score in zip(feature_cols, mi_scores):
+        normalised = float(score) / normaliser
+        if normalised >= threshold:
+            leaky.append({
+                "column": col,
+                "mi_score": round(float(score), 4),
+                "normalised_mi": round(normalised, 4),
+            })
+
+    leaky.sort(key=lambda x: x["normalised_mi"], reverse=True)
+    return leaky
+
+
+def scale_range_report(df: pd.DataFrame, schema: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Compute min/max range per numeric column and detect scale mismatches.
+    A mismatch is flagged when the largest range is >= 50x the median range.
+    Adapted from EDA notebook scale_range_report() logic.
+    """
+    ranges = []
+    for col, t in schema.items():
+        if t not in NUMERIC_SCHEMA_TYPES or col not in df.columns:
+            continue
+        s = pd.to_numeric(df[col], errors="coerce").dropna()
+        if s.empty:
+            continue
+        mn, mx = float(s.min()), float(s.max())
+        rg = mx - mn
+        ranges.append({"column": col, "min": round(mn, 6), "max": round(mx, 6), "range": round(rg, 6)})
+
+    ranges.sort(key=lambda d: d["range"], reverse=True)
+
+    range_values = [d["range"] for d in ranges if d["range"] > 0]
+    if len(range_values) < 2:
+        scale_mismatch = False
+        scale_range_ratio = 1.0
+    else:
+        max_r = max(range_values)
+        med_r = float(np.median(range_values))
+        ratio = max_r / med_r if med_r else float("inf")
+        scale_range_ratio = round(ratio, 2)
+        scale_mismatch = ratio >= 50
+
+    return {
+        "scale_range": ranges,
+        "scale_range_ratio": scale_range_ratio,
+        "scale_mismatch": scale_mismatch,
+    }
+
+
 def profile_dataset(df: pd.DataFrame, target: str, target_source: str = "inferred", target_candidate_scores: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
     if target not in df.columns:
         raise ValueError(f"Target column '{target}' not found in dataset columns.")
@@ -357,6 +475,19 @@ def profile_dataset(df: pd.DataFrame, target: str, target_source: str = "inferre
     profile["outlier_cols"] = outlier_cols
     if outlier_cols:
         notes.append(f"Outliers detected (>5% IQR) in: {outlier_cols[:5]}. Consider robust scaling.")
+
+    leaky = leakage_report(df, target, profile["schema"], is_classification=profile["is_classification"])
+    profile["leaky_cols"] = leaky
+    if leaky:
+        names = [c["column"] for c in leaky]
+        notes.append(f"Potential leakage detected in: {names}. Check before training.")
+
+    sr = scale_range_report(df, profile["schema"])
+    profile["scale_range"] = sr["scale_range"]
+    profile["scale_range_ratio"] = sr["scale_range_ratio"]
+    profile["scale_mismatch"] = sr["scale_mismatch"]
+    if sr["scale_mismatch"]:
+        notes.append(f"Scale mismatch detected (ratio={sr['scale_range_ratio']}x): consider robust scaling.")
 
     cr = correlation_report(df, profile["schema"])
     profile["correlation"] = serialize_correlation_matrix(cr["corr"])

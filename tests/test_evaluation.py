@@ -6,9 +6,11 @@ matrix), write_markdown_report (classification and regression reports written
 with correct content).
 """
 import os
+import numpy as np
 import pandas as pd
 import pytest
 
+from tools import evaluation as evaluation_module
 from tools.evaluation import evaluate_best, write_markdown_report
 
 
@@ -80,6 +82,29 @@ def test_evaluate_best_classification_saves_confusion_matrix(tmp_path):
 def test_evaluate_best_classification_has_report(tmp_path):
     result = evaluate_best(cls_payload(), str(tmp_path), is_classification=True)
     assert result["classification_report"] is not None
+
+
+def test_evaluate_best_uses_same_label_order_for_confusion_matrix_and_plot(tmp_path, monkeypatch):
+    payload = cls_payload()
+    payload["best"]["y_test"] = pd.Series([1, 10, 2, 10, 1, 2])
+    payload["best"]["y_pred"] = [1, 2, 2, 10, 10, 2]
+
+    recorded: dict = {}
+
+    def fake_confusion_matrix(y_true, y_pred, labels=None):
+        recorded["cm_labels"] = list(labels)
+        return np.eye(len(labels), dtype=int)
+
+    def fake_plot_confusion_matrix(cm, labels, out_path, title):
+        recorded["plot_labels"] = list(labels)
+
+    monkeypatch.setattr(evaluation_module, "confusion_matrix", fake_confusion_matrix)
+    monkeypatch.setattr(evaluation_module, "plot_confusion_matrix", fake_plot_confusion_matrix)
+
+    evaluate_best(payload, str(tmp_path), is_classification=True)
+
+    assert recorded["cm_labels"] == [1, 2, 10]
+    assert recorded["plot_labels"] == ["1", "2", "10"]
 
 
 def test_evaluate_best_regression_no_confusion_matrix(tmp_path):
@@ -174,6 +199,85 @@ def test_write_markdown_report_classification_contains_accuracy(tmp_path):
     assert "RandomForest" in content
 
 
+def test_write_markdown_report_uses_confidence_aware_summary_language(tmp_path):
+    out = str(tmp_path / "report.md")
+    payload = cls_payload()
+    eval_result = evaluate_best(payload, str(tmp_path), is_classification=True)
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_summary",
+        dataset_profile=_cls_profile(),
+        plan=["profile_dataset", "train_models"],
+        eval_payload=eval_result,
+        reflection={"status": "ok", "issues": [], "suggestions": [], "replan_recommended": False, "training_warnings": []},
+    )
+    content = open(out).read()
+    assert "strongest model on the held-out split" in content
+    assert "confirmed across additional splits or cross-validation" in content
+
+
+def test_write_markdown_report_surfaces_cross_validation_results(tmp_path):
+    out = str(tmp_path / "report.md")
+    payload = cls_payload()
+    eval_result = evaluate_best(payload, str(tmp_path), is_classification=True)
+    eval_result["cross_validation"] = {
+        "enabled": True,
+        "reason": "",
+        "n_splits": 5,
+        "models": [
+            {
+                "model": "RandomForest",
+                "balanced_accuracy_mean": 0.812,
+                "balanced_accuracy_std": 0.021,
+                "f1_macro_mean": 0.804,
+                "f1_macro_std": 0.018,
+            }
+        ],
+        "warnings": [],
+    }
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_cv",
+        dataset_profile=_cls_profile(),
+        plan=["profile_dataset", "train_models", "evaluate", "validate_with_cross_validation", "reflect"],
+        eval_payload=eval_result,
+        reflection={"status": "ok", "issues": [], "suggestions": [], "replan_recommended": False, "training_warnings": []},
+    )
+    content = open(out).read()
+    assert "### Cross-Validation Check" in content
+    assert "Balanced Acc (mean +/- std)" in content
+    assert "0.812 +/- 0.021" in content
+
+
+def test_write_markdown_report_uses_cross_validation_in_caution_summary(tmp_path):
+    out = str(tmp_path / "report.md")
+    payload = cls_payload()
+    eval_result = evaluate_best(payload, str(tmp_path), is_classification=True)
+    eval_result["cross_validation"] = {
+        "enabled": True,
+        "reason": "",
+        "n_splits": 5,
+        "models": [
+            {
+                "model": "RandomForest",
+                "balanced_accuracy_mean": 0.650,
+                "balanced_accuracy_std": 0.120,
+                "f1_macro_mean": 0.640,
+                "f1_macro_std": 0.110,
+            }
+        ],
+        "warnings": [],
+    }
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_cv_caution",
+        dataset_profile=_cls_profile(),
+        plan=["profile_dataset", "train_models", "evaluate", "validate_with_cross_validation", "reflect"],
+        eval_payload=eval_result,
+        reflection={"status": "ok", "issues": [], "suggestions": [], "replan_recommended": False, "training_warnings": []},
+    )
+    content = open(out).read()
+    assert "Use with caution" in content
+    assert "held-out split may be optimistic" in content
+
+
 def test_write_markdown_report_regression_contains_r2(tmp_path):
     out = str(tmp_path / "report.md")
     payload = reg_payload()
@@ -231,3 +335,98 @@ def test_write_markdown_report_shows_reflection_suggestions(tmp_path):
     )
     content = open(out).read()
     assert "Add more data" in content
+
+
+def test_write_markdown_report_includes_reflection_status_issues_and_warnings(tmp_path):
+    out = str(tmp_path / "report.md")
+    payload = cls_payload()
+    eval_result = evaluate_best(payload, str(tmp_path), is_classification=True)
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_warn",
+        dataset_profile=_cls_profile(),
+        plan=["profile_dataset", "build_preprocessor", "train_models", "evaluate", "reflect", "write_report"],
+        eval_payload=eval_result,
+        reflection={
+            "status": "needs_attention",
+            "issues": ["Best model only marginally beats baseline."],
+            "suggestions": ["Try stronger feature engineering."],
+            "replan_recommended": True,
+            "training_warnings": ["RuntimeWarning: overflow encountered in matmul"],
+        },
+    )
+    content = open(out).read()
+    assert "Needs Attention" in content
+    assert "Best model only marginally beats baseline." in content
+    assert "RuntimeWarning: overflow encountered in matmul" in content
+
+
+def test_write_markdown_report_shows_reliable_result_verdict(tmp_path):
+    out = str(tmp_path / "report.md")
+    payload = cls_payload()
+    eval_result = evaluate_best(payload, str(tmp_path), is_classification=True)
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_reliable",
+        dataset_profile=_cls_profile(),
+        plan=["profile_dataset", "train_models"],
+        eval_payload=eval_result,
+        reflection={"status": "ok", "issues": [], "suggestions": [], "replan_recommended": False, "training_warnings": []},
+    )
+    content = open(out).read()
+    assert "Reliable result" in content
+
+
+def test_write_markdown_report_shows_use_with_caution_verdict(tmp_path):
+    out = str(tmp_path / "report.md")
+    payload = cls_payload()
+    payload["best"]["metrics"]["model"] = "DummyMostFrequent"
+    eval_result = evaluate_best(payload, str(tmp_path), is_classification=True)
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_caution",
+        dataset_profile=_cls_profile(),
+        plan=["profile_dataset", "train_models"],
+        eval_payload=eval_result,
+        reflection={"status": "needs_attention", "issues": ["Weak performance."], "suggestions": [], "replan_recommended": False, "training_warnings": []},
+    )
+    content = open(out).read()
+    assert "Use with caution" in content
+    assert "treated cautiously" in content
+
+
+def test_write_markdown_report_shows_invalid_due_to_leakage_risk_verdict(tmp_path):
+    out = str(tmp_path / "report.md")
+    payload = reg_payload()
+    payload["best"]["metrics"]["r2"] = 1.0
+    eval_result = evaluate_best(payload, str(tmp_path), is_classification=False)
+    profile = _reg_profile()
+    profile["high_corr_pairs"] = [{"col_a": "a", "col_b": "b", "abs_corr": 0.95}]
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_invalid",
+        dataset_profile=profile,
+        plan=["profile_dataset", "train_models"],
+        eval_payload=eval_result,
+        reflection={"status": "ok", "issues": [], "suggestions": [], "replan_recommended": False, "training_warnings": []},
+    )
+    content = open(out).read()
+    assert "Invalid due to leakage risk" in content
+    assert "should not be treated as trustworthy" in content
+
+
+def test_write_markdown_report_filters_internal_replan_step_and_surfaces_quality_risks(tmp_path):
+    out = str(tmp_path / "report.md")
+    payload = cls_payload()
+    eval_result = evaluate_best(payload, str(tmp_path), is_classification=True)
+    profile = _cls_profile()
+    profile["high_corr_pairs"] = [{"col_a": "a", "col_b": "b", "abs_corr": 0.94}]
+    profile["high_corr_present"] = True
+    profile["notes"] = ["Ordinal-like numeric columns detected."]
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_plan",
+        dataset_profile=profile,
+        plan=["profile_dataset", "build_preprocessor", "train_models", "evaluate", "reflect", "write_report", "use_ensemble_models", "replan_attempt"],
+        eval_payload=eval_result,
+        reflection={"status": "ok", "suggestions": [], "issues": [], "replan_recommended": False, "training_warnings": []},
+    )
+    content = open(out).read()
+    assert "replan_attempt" not in content
+    assert "High correlation detected between" in content
+    assert "A replan attempt was triggered after reflection." in content

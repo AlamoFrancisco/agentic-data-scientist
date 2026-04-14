@@ -12,13 +12,15 @@ TODO: Extend this module with:
 5. Learning from past reflections (meta-learning)
 """
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def reflect(
     dataset_profile: Dict[str, Any],
     evaluation: Dict[str, Any],
-    all_metrics: List[Dict[str, Any]]
+    all_metrics: List[Dict[str, Any]],
+    training_warnings: Optional[List[str]] = None,
+    cv_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Analyze results and generate reflection with issues and suggestions.
@@ -57,6 +59,57 @@ def reflect(
 
     issues: List[str] = []
     suggestions: List[str] = []
+    cv_concerns = False
+
+    def check_cv_consistency(split_metric: float, metric_name: str) -> None:
+        nonlocal cv_concerns
+        if not cv_summary or not cv_summary.get("enabled"):
+            return
+
+        cv_models = cv_summary.get("models", [])
+        if not cv_models:
+            return
+
+        cv_entry = next((m for m in cv_models if m.get("model") == best_model), None)
+        if cv_entry is None:
+            return
+
+        mean_key = f"{metric_name}_mean"
+        std_key = f"{metric_name}_std"
+        cv_mean = float(cv_entry.get(mean_key, 0.0))
+        cv_std = float(cv_entry.get(std_key, 0.0))
+        gap = abs(split_metric - cv_mean)
+        unstable_std = 0.05 if is_classification else 0.10
+        unstable_gap = 0.08 if is_classification else 0.15
+
+        if gap > unstable_gap:
+            cv_concerns = True
+            issues.append(
+                f"Held-out {metric_name.replace('_', ' ')} ({split_metric:.3f}) differs noticeably "
+                f"from cross-validation mean ({cv_mean:.3f})."
+            )
+            suggestions.append(
+                "Treat the current split cautiously and prefer the cross-validation estimate "
+                "when judging model quality."
+            )
+
+        if cv_std > unstable_std:
+            cv_concerns = True
+            issues.append(
+                f"Cross-validation {metric_name.replace('_', ' ')} is unstable across folds "
+                f"(std={cv_std:.3f})."
+            )
+            suggestions.append(
+                "Performance appears split-sensitive. Consider more data, stronger regularization, "
+                "or simpler models."
+            )
+
+        cv_best_model = cv_summary.get("best_model")
+        if cv_best_model and cv_best_model != best_model:
+            suggestions.append(
+                f"Cross-validation ranked `{cv_best_model}` above the held-out winner `{best_model}`. "
+                "Use the cross-validated ranking for the final decision."
+            )
 
     # Route to regression or classification analysis
     if not is_classification:
@@ -77,12 +130,45 @@ def reflect(
         if r2 < 0.1:
             issues.append(f"R² is very low ({r2:.3f}) — model explains little variance.")
             suggestions.append("Try feature engineering or check if target is predictable.")
+
+        # Numerical instability warnings
+        numerical_warning_keywords = ("overflow", "divide by zero", "invalid value")
+        numerical_warnings = [
+            w for w in (training_warnings or [])
+            if any(kw in w.lower() for kw in numerical_warning_keywords)
+        ]
+        if numerical_warnings:
+            suggestions.append(
+                "Numerical instability detected during training (overflow/divide-by-zero). "
+                "Consider applying robust scaling or checking for extreme feature values."
+            )
+            if r2 < 0.1:
+                issues.append(
+                    "Numerical instability warnings present alongside low R² — "
+                    "scaling issues may be degrading model performance."
+                )
+
+        # Near-perfect R² across multiple real models is suspicious — likely leakage
+        real_reg_models = [m for m in all_metrics if "Dummy" not in m.get("model", "")]
+        near_perfect_reg = [m for m in real_reg_models if float(m.get("r2", 0.0)) >= 0.99]
+        if len(near_perfect_reg) >= 2:
+            issues.append(
+                "Near-perfect R² across multiple non-baseline models is suspicious."
+            )
+            suggestions.append(
+                "Inspect features for target proxies or columns that deterministically "
+                "derive the target (e.g. multiplicative combinations)."
+            )
+
+        check_cv_consistency(r2, "r2")
+
         return {
             "status": "needs_attention" if issues else "ok",
             "best_model": best_model,
             "issues": issues,
             "suggestions": suggestions,
-            "replan_recommended": bool(issues),
+            "replan_recommended": bool(issues and (r2 < 0.1 or cv_concerns)),
+            "training_warnings": training_warnings or [],
         }
 
     # Classification analysis below
@@ -144,6 +230,8 @@ def reflect(
         suggestions.append(
             "Inspect features for target proxies, leakage, or columns that deterministically map to the target."
         )
+
+    check_cv_consistency(bal_acc, "balanced_accuracy")
     
     # TODO: Add checks for:
     # - Model diversity (are all models performing similarly?)
@@ -157,18 +245,31 @@ def reflect(
                 "Try more diverse models or investigate data/preprocessing issues."
             )
 
-    # - Per-class performance (which classes are problematic?)
-    # - Precision-recall tradeoff
-    # - High-cardinality categorical features
-    # - Feature importance patterns
-    # - Learning curves (overfitting/underfitting)
-    
+    # Numerical instability warnings from training
+    # overflow/divide-by-zero in matmul = gradient computation hitting scale limits
+    numerical_warning_keywords = ("overflow", "divide by zero", "invalid value")
+    numerical_warnings = [
+        w for w in (training_warnings or [])
+        if any(kw in w.lower() for kw in numerical_warning_keywords)
+    ]
+    if numerical_warnings:
+        suggestions.append(
+            "Numerical instability detected during training (overflow/divide-by-zero). "
+            "Consider applying robust scaling or checking for extreme feature values."
+        )
+        # Escalate to issue if performance is also weak — instability may be the cause
+        if f1_macro < 0.60:
+            issues.append(
+                "Numerical instability warnings present alongside weak F1 — "
+                "scaling issues may be degrading model performance."
+            )
+
     # Determine status
     status = "needs_attention" if issues else "ok"
     
     # Simple replanning trigger
     # TODO: Make this more sophisticated
-    replan_recommended = bool(issues and f1_macro < 0.60)
+    replan_recommended = bool(issues and (f1_macro < 0.60 or cv_concerns))
     
     return {
         "status": status,
@@ -176,35 +277,21 @@ def reflect(
         "issues": issues,
         "suggestions": suggestions,
         "replan_recommended": replan_recommended,
+        "training_warnings": training_warnings or [],
     }
 
 
 def should_replan(reflection: Dict[str, Any]) -> bool:
     """
     Decide whether to trigger replanning based on reflection.
-    
-    This is a simple policy. Students should implement more sophisticated logic.
-    
-    TODO for students:
-    - Consider multiple factors (performance, confidence, resource budget)
-    - Implement diminishing returns detection
-    - Use memory to avoid repeating failed strategies
-    - Set adaptive thresholds based on problem difficulty
+
+    Only replan when the reflector explicitly sets replan_recommended=True.
+    Using issue count or status alone causes spurious replans on datasets where
+    near-perfect performance or expected warnings exist (e.g. penguins/species).
+    The reflect() function already integrates issue severity and f1 thresholds
+    before setting replan_recommended, so defer entirely to that signal.
     """
-    # Replan if explicitly recommended
-    if reflection.get("replan_recommended", False):
-        return True
-    
-    # Replan if multiple issues found
-    if len(reflection.get("issues", [])) >= 2:
-        return True
-    
-    # Replan if status is bad and there are suggestions to try
-    if reflection.get("status") == "needs_attention" and reflection.get("suggestions"):
-        return True
-    
-    # No reason to replan
-    return False
+    return bool(reflection.get("replan_recommended", False))
 
 
 
@@ -259,7 +346,7 @@ def apply_replan_strategy(
             new_plan.insert(new_plan.index("train_models"), "consider_imbalance_strategy")
     
     # If low performance: try ensemble methods
-    if any("F1" in issue for issue in issues):
+    if any("f1" in issue.lower() for issue in issues):
         if "try_ensemble_methods" not in new_plan:
             new_plan.append("try_ensemble_methods")
     

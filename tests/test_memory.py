@@ -66,6 +66,18 @@ def test_get_dataset_record_missing_returns_none(tmp_path):
     assert m.get_dataset_record("nonexistent") is None
 
 
+def test_get_dataset_record_require_reliable_skips_non_reliable_record(tmp_path):
+    m = JSONMemory(path=str(tmp_path / "mem.json"))
+    m.data["datasets"]["fp1"] = {"best_model": "RF", "verdict_label": "Use with caution"}
+    assert m.get_dataset_record("fp1", require_reliable=True) is None
+
+
+def test_get_dataset_record_require_reliable_returns_reliable_record(tmp_path):
+    m = JSONMemory(path=str(tmp_path / "mem.json"))
+    m.data["datasets"]["fp1"] = {"best_model": "RF", "verdict_label": "Reliable result"}
+    assert m.get_dataset_record("fp1", require_reliable=True) == {"best_model": "RF", "verdict_label": "Reliable result"}
+
+
 def test_upsert_persists_and_is_retrievable(tmp_path):
     path = tmp_path / "mem.json"
     m = JSONMemory(path=str(path))

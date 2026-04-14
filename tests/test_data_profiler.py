@@ -53,6 +53,18 @@ def test_infer_schema_bool_is_boolean():
     assert schema["flag"] == "boolean"
 
 
+def test_infer_schema_zero_one_numeric_is_boolean():
+    df = pd.DataFrame({"survived": [0, 1, 0, 1]})
+    schema = infer_schema(df)
+    assert schema["survived"] == "boolean"
+
+
+def test_infer_schema_two_value_nominal_string_is_not_boolean():
+    df = pd.DataFrame({"sex": ["male", "female", "female", "male"]})
+    schema = infer_schema(df)
+    assert schema["sex"] == "categorical"
+
+
 # ── infer_target_column ───────────────────────────────────────────────────────
 
 def test_infer_target_column_named_target():
@@ -178,7 +190,8 @@ def test_profile_dataset_classification_flag():
 
 
 def test_profile_dataset_regression_flag():
-    df = pd.DataFrame({"a": [1.0, 2.0, 3.0], "target": [10.5, 20.5, 30.5]})
+    # Need enough rows for MI computation (mutual_info_regression uses k-NN, needs > 3 samples)
+    df = pd.DataFrame({"a": range(20), "target": [float(i) * 1.5 for i in range(20)]})
     profile = profile_dataset(df, "target")
     assert profile["is_classification"] is False
     assert profile["class_counts"] is None
@@ -186,7 +199,7 @@ def test_profile_dataset_regression_flag():
 
 
 def test_profile_dataset_regression_note():
-    df = pd.DataFrame({"a": [1.0, 2.0, 3.0], "target": [10.5, 20.5, 30.5]})
+    df = pd.DataFrame({"a": range(20), "target": [float(i) * 1.5 for i in range(20)]})
     profile = profile_dataset(df, "target")
     assert any("egression" in n for n in profile["notes"])
 

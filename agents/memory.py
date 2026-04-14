@@ -1,7 +1,7 @@
 import json
 import os
 import shutil
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime
 
 
@@ -35,20 +35,36 @@ class JSONMemory:
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(self.data, f, indent=2)
 
-    def get_dataset_record(self, fingerprint: str, dataset_name: Optional[str] = None, target: Optional[str] = None, shape: Optional[Dict] = None) -> Optional[Dict[str, Any]]:
+    def _is_reliable_record(self, record: Optional[Dict[str, Any]]) -> bool:
+        return bool(record) and record.get("verdict_label") == "Reliable result"
+
+    def get_dataset_record(
+        self,
+        fingerprint: str,
+        dataset_name: Optional[str] = None,
+        target: Optional[str] = None,
+        shape: Optional[Dict] = None,
+        require_reliable: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         datasets = self.data.get("datasets", {})
         # 1. Exact fingerprint match (same filename)
         if fingerprint in datasets:
-            return datasets[fingerprint]
+            record = datasets[fingerprint]
+            if not require_reliable or self._is_reliable_record(record):
+                return record
         # 2. Same dataset name
         if dataset_name:
             for record in datasets.values():
-                if record.get("dataset") == dataset_name:
+                if record.get("dataset") == dataset_name and (not require_reliable or self._is_reliable_record(record)):
                     return record
         # 3. Same target + shape (renamed file)
         if target and shape:
             for record in datasets.values():
-                if record.get("target") == target and record.get("shape") == shape:
+                if (
+                    record.get("target") == target
+                    and record.get("shape") == shape
+                    and (not require_reliable or self._is_reliable_record(record))
+                ):
                     return record
         return None
 
@@ -69,6 +85,18 @@ class JSONMemory:
     def add_note(self, msg: str) -> None:
         self.data.setdefault("notes", []).append({"ts": now_iso(), "msg": msg})
         self.save()
+
+    def add_failed_target(self, dataset_name: str, target: str) -> None:
+        """Record a target that produced no useful results on a dataset."""
+        failed = self.data.setdefault("failed_targets", {})
+        targets = failed.setdefault(dataset_name, [])
+        if target not in targets:
+            targets.append(target)
+        self.save()
+
+    def get_failed_targets(self, dataset_name: str) -> List[str]:
+        """Return list of targets that previously failed on this dataset."""
+        return self.data.get("failed_targets", {}).get(dataset_name, [])
         
     def get_similar_record(self, profile: Dict[str, Any], threshold: float = 0.5) -> Optional[Dict[str, Any]]:
         # Start with no match found and a score of zero
@@ -128,4 +156,3 @@ class JSONMemory:
         return score / checks if checks > 0 else 0.0
 
    
-

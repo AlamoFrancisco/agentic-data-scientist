@@ -1,6 +1,6 @@
-# CE888 Agentic Data Scientist - Student Template
+# CE888 Agentic Data Scientist
 
-**Name** Francisco Antontio Alamo Rios
+**Name:** Francisco Antonio Alamo Rios  
 **Assignment:** Offline Agentic AI for Data Science  
 **Module:** CE888  
 **Academic Year:** 2025/2026
@@ -9,49 +9,37 @@
 
 ## Overview
 
-This repository contains the skeleton code for building an **Offline Agentic Data Scientist** - an autonomous agent that performs end-to-end classification tasks without relying on Large Language Models.
+An **Offline Agentic Data Scientist** — an autonomous agent that performs end-to-end data science tasks (classification and regression) without relying on Large Language Models.
 
-Your agent will use **rule-based reasoning, heuristics, and meta-learning** to autonomously:
-- Profile datasets
-- Plan execution workflows
-- Train and evaluate models
-- Reflect on results
-- Learn from experience
+The agent uses **rule-based reasoning, heuristics, and meta-learning** to autonomously:
+- Profile datasets (scale, leakage, imbalance, missing data, near-constant features)
+- Plan execution workflows adapted to dataset characteristics
+- Train and evaluate models (Logistic Regression, Random Forest, Gradient Boosting, SVC, Dummy)
+- Reflect on results and trigger targeted replanning
+- Learn from experience across runs via persistent memory
 
 ---
 
 ## Quick Start
 
-### 1. Clone this repository
-
 ```bash
-git clone https://github.com/sagihaider/ce888-agentic-data-scientist.git
-cd ce888-agentic-data-scientist
-```
-
-### 2. Set up your environment
-
-```bash
-# Create virtual environment
+# Set up environment
 python -m venv venv
+source venv/bin/activate       # macOS/Linux
+# venv\Scripts\activate        # Windows
 
-# Activate it
-# On Windows:
-venv\Scripts\activate
-# On macOS/Linux:
-source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
+
+# Run on a dataset
+python run_agent.py --data data/penguins.csv --target species
+python run_agent.py --data data/titanic.csv --target survived
+python run_agent.py --data data/Sales.csv --target revenue_usd
+
+# Auto-detect target column
+python run_agent.py --data data/penguins.csv --target auto
 ```
 
-### 3. Test the skeleton
-
-```bash
-python run_agent.py --data data/example_dataset.csv --target auto
-```
-
-You should see the agent run through the basic pipeline and generate outputs in `outputs/[timestamp]/`
+Outputs are written to `outputs/[timestamp]/`.
 
 ---
 
@@ -61,75 +49,98 @@ You should see the agent run through the basic pipeline and generate outputs in 
 ce888-agentic-data-scientist/
 │
 ├── README.md                       # This file
-├── requirements.txt                # Python dependencies
-├── .gitignore                      # Git ignore rules
+├── requirements.txt                # Python dependencies (scikit-learn>=1.3.0 required)
+├── AGENT_SIGNAL_MAP.md             # Reference: signals → plan → executor → reflector
+├── .gitignore
 │
-├── agentic_data_scientist.py      # Core agent (Executor) - extend this
-├── run_agent.py                   # Entry point - students run this
+├── agentic_data_scientist.py      # Core agent (Executor + orchestration)
+├── run_agent.py                   # CLI entry point
 │
-├── agents/                        # Agent components
-│   ├── __init__.py
-│   ├── planner.py                 # TODO: EXTEND THIS
-│   ├── reflector.py               # TODO: EXTEND THIS
-│   └── memory.py                  # Basic implementation - can extend
+├── agents/
+│   ├── planner.py                 # Dataset-adaptive planning logic
+│   ├── reflector.py               # Performance analysis and replanning
+│   └── memory.py                  # Persistent experience store (agent_memory.json)
 │
-├── tools/                         # Data science tools
-│   ├── __init__.py
-│   ├── data_profiler.py          # Provided - can extend
-│   ├── modelling.py              # Provided - can extend
-│   └── evaluation.py             # Provided - can extend
+├── tools/
+│   ├── data_profiler.py          # Dataset profiling (MI leakage, scale, correlations)
+│   ├── modelling.py              # Model training with preprocessing pipeline
+│   └── evaluation.py             # Metrics and reporting
 │
-├── data/                          # Datasets
-│   ├── README.md                 # Dataset documentation template
-│   └── example_dataset.csv       # Small demo dataset
+├── data/
+│   ├── README.md                 # Dataset documentation and trigger conditions
+│   ├── penguins.csv              # Small classification (344 rows)
+│   ├── titanic.csv               # Small classification with leakage (891 rows)
+│   ├── digits.csv                # Medium classification, near-constant features (1797 rows)
+│   ├── Sales.csv                 # Large regression with target encoding (30000 rows)
+│   ├── WineQuality.csv           # Medium regression (1700 rows)
+│   └── demo.csv                  # 20-row smoke test dataset
 │
 ├── outputs/                       # Generated outputs (gitignored)
 │   └── .gitkeep
 │
-├── report/                        # Your technical report
-│   ├── README.md                 # Report guidelines
-│   └── REPORT.md                 # TODO: WRITE YOUR REPORT HERE
+├── report/
+│   └── REPORT.md                 # Technical report (3000-4000 words)
 │
-└── tests/                         # Test suite
-    ├── __init__.py
-    └── sanity_check.py           # Basic sanity test
+└── tests/
+    ├── test_planner.py
+    ├── test_reflector.py
+    ├── test_data_profiler.py
+    ├── test_modelling.py
+    ├── test_memory.py
+    ├── test_smoke_run.py          # End-to-end smoke tests
+    └── sanity_check.py
 ```
 
 ---
 
-## What You Need To Do
+## Features Implemented
 
-### Core Tasks (Mandatory)
+### 1. Planner (`agents/planner.py`)
+Dataset-adaptive planning based on profiler signals:
 
-1. **Extend the Planner Agent** (`agents/planner.py`)
-   - Implement sophisticated planning logic based on dataset characteristics
-   - Create different plan templates for different scenarios
-   - Use memory hints to guide planning
-   - Handle edge cases (small datasets, high imbalance, etc.)
+| Signal | Plan step |
+|--------|-----------|
+| rows < 1000 | `apply_regularization` + `use_simple_models_only` |
+| rows ≥ 10,000 | `use_ensemble_models` |
+| scale mismatch (max/median range ≥ 50) | `apply_robust_scaling` |
+| MI leakage ≥ 0.9 | `drop_leaky_features` |
+| high-cardinality categoricals (n_unique > 50) | `apply_target_encoding` |
+| correlated features (abs_corr ≥ 0.95) | `drop_correlated_features` |
+| near-constant columns (≥ 95% dominant value) | `drop_near_constant_features` |
+| imbalance ratio ≥ 3.0 | `consider_imbalance_strategy` |
+| memory hint (prior best model) | `prioritize_model:<name>` |
 
-2. **Extend the Reflector Agent** (`agents/reflector.py`)
-   - Implement deep performance analysis
-   - Add statistical significance testing
-   - Generate actionable improvement suggestions
-   - Implement smart replanning decisions
+### 2. Reflector (`agents/reflector.py`)
+Performance-aware reflection with targeted replanning:
+- Flags models barely beating dummy (< 0.05 margin)
+- Detects suspected overfitting (bal_acc > 0.90 but f1 < 0.70)
+- Raises near-perfect performance warnings (≥ 2 non-dummy models with score ≥ 0.99) — both classification and regression
+- Acts on numerical instability warnings (overflow/divide-by-zero) from training
+- `replan_recommended` gate prevents spurious replans on genuinely well-performing datasets
 
-3. **Enhance the Executor** (`agentic_data_scientist.py`)
-   - Add robust error handling
-   - Implement retry logic
-   - Add detailed logging
-   - Support conditional execution based on plans
+### 3. Executor (`agentic_data_scientist.py`)
+- Handlers for all plan flags from the planner
+- Training retry loop (3 attempts)
+- Saves failed targets to memory to avoid re-running them
 
-4. **Improve the Memory System** (`agents/memory.py`)
-   - Add similarity-based retrieval
-   - Implement richer experience storage
-   - Enable learning from past executions
+### 4. Memory (`agents/memory.py`)
+- Stores best model, metrics, and reflection status per dataset+target
+- Failed target tracking — skips targets that previously produced no useful result
+- Similarity matching across datasets (size bucket, imbalance, missingness)
+- Memory hint passed to Planner to prioritise previously successful models
 
-### Evaluation & Reporting
+### 5. Data Profiler (`tools/data_profiler.py`)
+Extended profiling signals:
+- Scale mismatch detection (`scale_range_report`)
+- Mutual information leakage detection — classification uses entropy normalisation, regression uses max-MI normalisation (`leakage_report`)
+- Near-constant column detection (≥ 95% dominant value)
+- Automatic target column inference with failed-target awareness
 
-- Test on **at least 3 diverse classification datasets**
-- Write a **3000-4000 word technical report** in `report/REPORT.md`
-- Create comprehensive tests with >60% coverage
-- Document all datasets in `data/README.md`
+### 6. Modelling (`tools/modelling.py`)
+- `TargetEncoder` (sklearn ≥ 1.3) for high-cardinality categoricals — fitted inside Pipeline to prevent leakage
+- `RobustScaler` for outlier handling
+- Size-bucket model selection (small/medium/large)
+- Runtime warnings captured and surfaced to Reflector
 
 ---
 
@@ -138,163 +149,96 @@ ce888-agentic-data-scientist/
 ### Basic Usage
 
 ```bash
-python run_agent.py --data data/example_dataset.csv --target auto
+python run_agent.py --data data/penguins.csv --target species
 ```
 
-### Custom Parameters
+### All Arguments
 
 ```bash
 python run_agent.py \
     --data data/your_dataset.csv \
     --target target_column_name \
-    --output_root my_outputs \
+    --output_root outputs \
     --seed 42 \
     --test_size 0.2 \
-    --max_replans 2
+    --max_replans 2 \
+    --quiet
 ```
 
-### Arguments
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--data` | Path to CSV dataset | required |
+| `--target` | Target column or `auto` | required |
+| `--output_root` | Output directory | `outputs` |
+| `--seed` | Random seed | 42 |
+| `--test_size` | Test fraction | 0.2 |
+| `--max_replans` | Max replanning attempts | 1 |
+| `--quiet` | Reduce logging | False |
 
-- `--data`: Path to CSV dataset (required)
-- `--target`: Target column name or 'auto' for automatic detection (required)
-- `--output_root`: Output directory (default: 'outputs')
-- `--seed`: Random seed for reproducibility (default: 42)
-- `--test_size`: Test set fraction (default: 0.2)
-- `--max_replans`: Maximum replanning attempts (default: 1)
-- `--quiet`: Reduce logging output
+### Output Files
+
+Each run creates `outputs/[timestamp]/`:
+
+| File | Contents |
+|------|----------|
+| `report.md` | Human-readable run summary |
+| `eda_summary.json` | Dataset profile |
+| `plan.json` | Generated execution plan |
+| `metrics.json` | Model performance metrics |
+| `reflection.json` | Issues, suggestions, replan status |
+| `confusion_matrix.png` | Confusion matrix (classification only) |
+
+---
+
+## Datasets
+
+See [data/README.md](data/README.md) for full documentation of all datasets and the profiler signals each one triggers.
+
+| Dataset | Rows | Task | Key triggers |
+|---------|------|------|-------------|
+| `penguins.csv` | 344 | Classification | `apply_regularization`, `apply_robust_scaling` |
+| `titanic.csv` | 891 | Classification | `drop_leaky_features` (`alive` col), `handle_outliers` |
+| `digits.csv` | 1797 | Classification | `drop_near_constant_features` (14 border pixels) |
+| `Sales.csv` | 30000 | Regression | `apply_target_encoding`, `drop_leaky_features`, `use_ensemble_models` |
+| `WineQuality.csv` | 1700 | Regression | Baseline regression pipeline |
 
 ---
 
 ## Testing
 
-Run the sanity check:
-
 ```bash
-python tests/sanity_check.py
-```
-
-Run all tests (once you add them):
-
-```bash
+# Run all tests
 pytest tests/
+
+# With coverage report
+pytest --cov=agents --cov=tools --cov=agentic_data_scientist --cov-report=term-missing tests/
 ```
 
-With coverage:
-
-```bash
-pytest --cov=agents --cov=tools --cov-report=html tests/
-```
-
----
-
-## Expected Output
-
-After running the agent, check `outputs/[timestamp]/` for:
-
-- `report.md` - Human-readable summary report
-- `eda_summary.json` - Dataset profile and characteristics
-- `plan.json` - Generated execution plan
-- `metrics.json` - Model performance metrics
-- `reflection.json` - Agent's self-assessment and suggestions
-- `confusion_matrix.png` - Confusion matrix visualization
-
----
-
-## Development Workflow
-
-1. **Week 1-2:** Understand the skeleton, run basic examples
-2. **Week 3-4:** Extend Planner and Reflector with sophisticated logic
-3. **Week 5-7:** Implement 3+ advanced features
-4. **Week 8:** Add comprehensive tests and documentation
-5. **Week 9:** Write technical report and prepare demo
-
----
-
-## Key Files to Modify
-
-### High Priority (Must Extend)
-- `agents/planner.py` - Your planning logic
-- `agents/reflector.py` - Your reflection logic
-- `agentic_data_scientist.py` - Enhanced executor
-
-### Medium Priority (Should Extend)
-- `agents/memory.py` - Richer memory system
-- `tools/modelling.py` - Additional models or strategies
-- `tests/test_*.py` - Your test cases
-
-### Low Priority (Optional Extensions)
-- `tools/data_profiler.py` - Additional profiling features
-- `tools/evaluation.py` - More evaluation metrics
-- New tool files for advanced features
+Current coverage: **93%** (126 tests, 0 failing)
 
 ---
 
 ## Submission Checklist
 
-Before submitting, ensure:
-
-- [ ] All code runs without errors
-- [ ] README.md updated with your modifications
-- [ ] requirements.txt includes any new dependencies
-- [ ] At least 3 test datasets documented in `data/README.md`
-- [ ] Technical report completed (3000-4000 words)
-- [ ] Test coverage >60%
-- [ ] All core components extended significantly
-- [ ] At least 3 advanced features implemented
-- [ ] GitHub repository is clean and organised
-
----
-
-## Getting Help
-
-- **Lectures:** All the lectures and labs are important. Each session will enhance your knowledge. 
-- **Office Hours:** 9-10 am (Monday and Friday)
-- **Forum:** Moodle discussion board - for clarifications (no code sharing)
-
----
-
-## Important Deadlines
-
-- **Data Exploration**. Deadline:  16-Feb-2026 13:59:59
-- **Final Project Demonstration**. Deadline:  21-Apr-2026 13:59:59
-- **Final Project Code**. Deadline:  21-Apr-2026 13:59:59
+- [x] All code runs without errors
+- [x] README.md updated with actual implementation details
+- [x] requirements.txt includes all dependencies (`scikit-learn>=1.3.0`)
+- [x] 5 datasets documented in `data/README.md` (4 evaluation + 1 smoke test)
+- [x] Technical report completed — `report/REPORT.md` (3019 words)
+- [x] Test coverage > 60% (93% achieved)
+- [x] All core components extended significantly
+- [x] At least 3 advanced features implemented
+- [x] Repository is clean and organised
 
 ---
 
 ## Academic Integrity
 
-- This is **individual work** - no code sharing with classmates
-- You may use standard libraries and consult documentation
-- AI assistance is allowed but must be disclosed in your report
-- Cite any code adapted from external sources
-- Plagiarism will result in severe penalties
+This is individual work. AI assistance was used and is disclosed in the technical report (Section 9).
 
 ---
 
-## Resources
+## Important Deadlines
 
-- **Scikit-learn:** https://scikit-learn.org/stable/
-- **Pandas:** https://pandas.pydata.org/docs/
-- **Assignment Brief:** See Moodle for full details
-- **Dataset Sources:**
-  - Kaggle: https://www.kaggle.com/datasets
-  - UCI ML Repository: https://archive.ics.uci.edu/ml
-  - OpenML: https://www.openml.org/
-
----
-
-## Contact
-
-**Module Leader:** Dr Haider Raza  
-
-**Email:** use my essex email address
-
-**Office Hours:** Monday and Friday 9-10 AM. 
-
----
-
-## Release & License
-
-- **License:** This project is released under the **MIT License** by default. See `LICENSE` for full terms. If you'd prefer a different license (e.g., Apache-2.0, CC-BY), replace `LICENSE` accordingly before publishing.
-
-**Good luck with your assignment! Build something you're proud of!** 🚀
+- **Final Project Demonstration:** 21 April 2026, 13:59:59
+- **Final Project Code:** 21 April 2026, 13:59:59
