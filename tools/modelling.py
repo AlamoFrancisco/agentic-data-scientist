@@ -1,4 +1,46 @@
+"""
+Modelling Tools
+
+Preprocessing pipeline construction, model selection, training, and cross-validation.
+
+Implemented:
+- build_preprocessor: ColumnTransformer with adaptive imputation, StandardScaler /
+  RobustScaler (outlier or scale-mismatch flag), OneHotEncoder for low-cardinality
+  categoricals, TargetEncoder (sklearn ≥1.3) for high-cardinality columns; drops
+  near-constant, correlated, and leaky features before fitting
+- select_models: size-bucket selection (small / medium / large); class_weight='balanced'
+  for imbalanced datasets; SVC only for small datasets (rows <1000, cols ≤50) to avoid
+  O(n²–n³) cost; preferred model from memory hint placed first
+- train_models: stratified train/test split, per-model warning capture
+  (overflow / divide-by-zero surfaced to Reflector), classification + regression support
+- cross_validate_top_models: StratifiedKFold / KFold CV for the top-k candidates;
+  returns per-model mean ± std for primary metric
+- tune_best_model: RandomizedSearchCV over a per-model param grid on the best
+  candidate; replaces the best entry in the training payload with the tuned version
+"""
+
 from typing import Any, Dict, List, Optional, Tuple
+
+from config import (
+    SMALL_DATASET_ROWS,
+    LARGE_DATASET_ROWS,
+    MISSING_THRESHOLD_SMALL,
+    MISSING_THRESHOLD_MEDIUM,
+    MISSING_THRESHOLD_LARGE,
+    MAX_OHE_UNIQUE,
+    MAX_OHE_UNIQUE_FRAC,
+    OUTLIER_CLIP_MIN_ROWS,
+    SVC_MAX_COLS,
+    N_ESTIMATORS,
+    LR_C_DEFAULT,
+    LR_C_REGULARISED,
+    IMBALANCE_THRESHOLD,
+    CV_SPLITS_SMALL,
+    CV_SPLITS_DEFAULT,
+    CV_TOP_K,
+    TUNE_N_ITER,
+    TUNE_CV_SPLITS,
+)
 
 import warnings
 import pandas as pd
@@ -11,6 +53,7 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler, RobustScaler, T
 from sklearn.model_selection import (
     KFold,
     StratifiedKFold,
+    RandomizedSearchCV,
     cross_validate,
     train_test_split,
 )
@@ -18,12 +61,12 @@ from sklearn.model_selection import (
 # Classification models and metrics
 from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, HistGradientBoostingClassifier
 from sklearn.svm import SVC
 
-# Regression models and metrics 
-from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+# Regression models and metrics
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.dummy import DummyRegressor
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 
@@ -69,12 +112,12 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
 
     # Drop columns with too many missing values — threshold adapts to dataset size
     rows = profile["shape"]["rows"]
-    if rows < 1000:
-        missing_threshold = 60.0   # small dataset: keep more columns
-    elif rows < 10000:
-        missing_threshold = 50.0   # medium dataset
+    if rows < SMALL_DATASET_ROWS:
+        missing_threshold = MISSING_THRESHOLD_SMALL
+    elif rows < LARGE_DATASET_ROWS:
+        missing_threshold = MISSING_THRESHOLD_MEDIUM
     else:
-        missing_threshold = 40.0   # large dataset: stricter
+        missing_threshold = MISSING_THRESHOLD_LARGE
     missing_pct = profile.get("missing_pct", {})
     ord_cols = [c for c in ord_cols if missing_pct.get(c, 0) <= missing_threshold]
     cont_cols = [c for c in cont_cols if missing_pct.get(c, 0) <= missing_threshold]
@@ -86,7 +129,7 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     multi_cat_cols_before_card_filter = list(multi_cat_cols)
     multi_cat_cols = [
         c for c in multi_cat_cols
-        if n_unique.get(c, 0) < 50 and (n_unique.get(c, 0) / max(rows, 1)) < 0.05
+        if n_unique.get(c, 0) < MAX_OHE_UNIQUE and (n_unique.get(c, 0) / max(rows, 1)) < MAX_OHE_UNIQUE_FRAC
     ]
     # Cols that failed the cardinality filter — candidates for target encoding
     high_card_cols = [
@@ -99,38 +142,51 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     text_cols = [c for c in text_cols if missing_pct.get(c, 0) <= missing_threshold]
     high_card_cols += [
         c for c in text_cols
-        if 50 < n_unique.get(c, 0) < rows * 0.10
+        if MAX_OHE_UNIQUE < n_unique.get(c, 0) < rows * 0.10
     ]
     
     use_robust_scaling = profile.get("use_robust_scaling", False)
     handle_outliers = profile.get("handle_outliers", False)
+    robust_imputation = profile.get("robust_imputation", False)
 
     # Small datasets: RobustScaler only — clipping risks losing too much information
     # Large datasets: RobustScaler with quantile clamping (unit_variance clips extremes)
-    if handle_outliers and rows >= 1000:
+    if handle_outliers and rows >= OUTLIER_CLIP_MIN_ROWS:
         scaler = RobustScaler(unit_variance=True)
     elif use_robust_scaling or handle_outliers:
         scaler = RobustScaler()
     else:
         scaler = StandardScaler(with_mean=True)
 
+    if robust_imputation:
+        continuous_imputer = SimpleImputer(strategy="median", add_indicator=True)
+        ordinal_imputer = SimpleImputer(strategy="median", add_indicator=True)
+        categorical_imputer = SimpleImputer(strategy="constant", fill_value="__missing__")
+        high_card_imputer = SimpleImputer(strategy="constant", fill_value="__missing__")
+    else:
+        continuous_imputer = SimpleImputer(strategy="median")
+        ordinal_imputer = SimpleImputer(strategy="median")
+        categorical_imputer = SimpleImputer(strategy="most_frequent")
+        high_card_imputer = SimpleImputer(strategy="most_frequent")
+
     continuous_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
+        ("imputer", continuous_imputer),
         ("scaler", scaler),
     ])
 
     ordinal_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
+        ("imputer", ordinal_imputer),
     ])
 
+    # Keep one-hot output sparse to avoid densifying wide categorical spaces.
     # scikit-learn renamed `sparse` -> `sparse_output` (v1.2+). Support both.
     try:
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
     except TypeError:
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse=True)
 
     categorical_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("imputer", categorical_imputer),
         ("onehot", ohe),
     ])
 
@@ -143,7 +199,7 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     # Target encoding for high-cardinality categoricals (only when flag is set)
     if profile.get("use_target_encoding") and high_card_cols:
         target_enc_transformer = Pipeline(steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("imputer", high_card_imputer),
             ("target_enc", TargetEncoder()),
         ])
         transformers.append(("high_card", target_enc_transformer, high_card_cols))
@@ -170,28 +226,33 @@ def select_models(
     rows = profile["shape"]["rows"]
     cols = profile["shape"]["cols"]
     imb = float(profile.get("imbalance_ratio") or 1.0)
-    class_weight = "balanced" if imb >= 3.0 else None
+    class_weight = "balanced" if imb >= IMBALANCE_THRESHOLD else None
+    simple_models_only = profile.get("simple_models_only", False)
     
     # Regression models if not a classification task
     if not profile.get("is_classification", True):
         candidates = [
             ("DummyMean", DummyRegressor(strategy="mean")),
             ("LinearRegression", LinearRegression()),
-            ("RandomForestRegressor", RandomForestRegressor(n_estimators=300, random_state=seed, n_jobs=-1)),
-            ("GradientBoostingRegressor", GradientBoostingRegressor(random_state=seed)),
+            ("Ridge", Ridge()),
         ]
+        if not simple_models_only:
+            candidates.extend([
+                ("RandomForestRegressor", RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=seed, n_jobs=-1)),
+                ("GradientBoostingRegressor", GradientBoostingRegressor(random_state=seed)),
+                ("HistGradientBoostingRegressor", HistGradientBoostingRegressor(random_state=seed)),
+            ])
         return prioritize_candidates(candidates, preferred_model)
 
     use_regularization = profile.get("use_regularization", False)
-    simple_models_only = profile.get("simple_models_only", False)
     prefer_ensemble = profile.get("prefer_ensemble", False)
-    lr_C = 0.1 if use_regularization else 1.0
+    lr_C = LR_C_REGULARISED if use_regularization else LR_C_DEFAULT
 
     candidates: List[Tuple[str, Any]] = [
         ("DummyMostFrequent", DummyClassifier(strategy="most_frequent")),
         ("LogisticRegression", LogisticRegression(C=lr_C, max_iter=2000, class_weight=class_weight, solver="saga", tol=1e-3, random_state=seed)),
         ("RandomForest", RandomForestClassifier(
-            n_estimators=300, random_state=seed, n_jobs=-1, class_weight=class_weight
+            n_estimators=N_ESTIMATORS, random_state=seed, n_jobs=-1, class_weight=class_weight
         )),
     ]
 
@@ -201,11 +262,12 @@ def select_models(
 
     # Large datasets: always include ensemble models (bucket: >= 10000)
     # Medium datasets: also include GradientBoosting (bucket: 1000–9999)
-    if prefer_ensemble or rows < 10000:
+    if prefer_ensemble or rows < LARGE_DATASET_ROWS:
         candidates.append(("GradientBoosting", GradientBoostingClassifier(random_state=seed)))
+        candidates.append(("HistGradientBoosting", HistGradientBoostingClassifier(random_state=seed)))
 
-    # SVC: small datasets only (bucket: < 1000) — O(n²–n³) cost, unused probability estimates dropped
-    if rows < 1000 and cols <= 50:
+    # SVC: small datasets only — O(n²–n³) cost, unused probability estimates dropped
+    if rows < SMALL_DATASET_ROWS and cols <= SVC_MAX_COLS:
         candidates.append(("SVC_RBF", SVC(kernel="rbf", probability=False, class_weight=class_weight)))
 
     return prioritize_candidates(candidates, preferred_model)
@@ -300,6 +362,10 @@ def train_models(
         "best": results[0],
         "all_metrics": [r["metrics"] for r in results],
         "training_warnings": all_warnings,
+        "X_train": X_train,
+        "y_train": y_train,
+        "X_test": X_test,
+        "y_test": y_test,
     }
 
 
@@ -312,7 +378,7 @@ def _cv_splitter(
     if rows < 4:
         return None
 
-    desired_splits = 5 if rows < 1000 else 3
+    desired_splits = CV_SPLITS_SMALL if rows < SMALL_DATASET_ROWS else CV_SPLITS_DEFAULT
 
     if is_classification:
         min_class_count = int(y.value_counts(dropna=False).min())
@@ -356,6 +422,7 @@ def _summarize_cv_metrics(
         summary["primary_metric"] = "balanced_accuracy"
         summary["primary_metric_mean"] = summary["balanced_accuracy_mean"]
         summary["primary_metric_std"] = summary["balanced_accuracy_std"]
+        summary["fold_scores"] = np.asarray(scores["test_balanced_accuracy"], dtype=float).tolist()
         return summary
 
     values = np.asarray(scores["test_r2"], dtype=float)
@@ -373,6 +440,7 @@ def _summarize_cv_metrics(
     summary["primary_metric"] = "r2"
     summary["primary_metric_mean"] = summary["r2_mean"]
     summary["primary_metric_std"] = summary["r2_std"]
+    summary["fold_scores"] = values.tolist()
     return summary
 
 
@@ -382,17 +450,21 @@ def cross_validate_top_models(
     training_payload: Dict[str, Any],
     seed: int,
     is_classification: bool = True,
-    top_k: int = 2,
+    top_k: int = CV_TOP_K,
 ) -> Dict[str, Any]:
     if target not in df.columns:
         raise ValueError(f"Target '{target}' not found.")
 
-    X = df.drop(columns=[target]).copy()
-    y = df[target].copy()
+    X = training_payload.get("X_train")
+    y = training_payload.get("y_train")
 
-    mask = ~y.isna()
-    X = X.loc[mask]
-    y = y.loc[mask]
+    if X is None or y is None:
+        X = df.drop(columns=[target]).copy()
+        y = df[target].copy()
+
+        mask = ~y.isna()
+        X = X.loc[mask]
+        y = y.loc[mask]
 
     splitter = _cv_splitter(y, seed=seed, rows=len(X), is_classification=is_classification)
     if splitter is None:
@@ -442,4 +514,160 @@ def cross_validate_top_models(
         "models": summaries,
         "best_model": summaries[0]["model"] if summaries else None,
         "warnings": deduped_warnings,
+    }
+
+
+def _param_grid(model_name: str) -> Dict[str, List[Any]]:
+    """Return a RandomizedSearchCV param grid keyed with the 'model__' pipeline prefix."""
+    grids: Dict[str, Dict[str, List[Any]]] = {
+        "RandomForest": {
+            "model__n_estimators": [100, 200, 300, 500],
+            "model__max_depth": [None, 5, 10, 20],
+            "model__min_samples_split": [2, 5, 10],
+            "model__min_samples_leaf": [1, 2, 4],
+        },
+        "RandomForestRegressor": {
+            "model__n_estimators": [100, 200, 300, 500],
+            "model__max_depth": [None, 5, 10, 20],
+            "model__min_samples_split": [2, 5, 10],
+            "model__min_samples_leaf": [1, 2, 4],
+        },
+        "GradientBoosting": {
+            "model__n_estimators": [100, 200, 300],
+            "model__learning_rate": [0.05, 0.1, 0.2],
+            "model__max_depth": [3, 4, 5],
+            "model__subsample": [0.8, 1.0],
+        },
+        "GradientBoostingRegressor": {
+            "model__n_estimators": [100, 200, 300],
+            "model__learning_rate": [0.05, 0.1, 0.2],
+            "model__max_depth": [3, 4, 5],
+            "model__subsample": [0.8, 1.0],
+        },
+        "HistGradientBoosting": {
+            "model__max_iter": [100, 200, 300],
+            "model__learning_rate": [0.05, 0.1, 0.2],
+            "model__max_depth": [None, 5, 10],
+            "model__min_samples_leaf": [20, 50, 100],
+        },
+        "HistGradientBoostingRegressor": {
+            "model__max_iter": [100, 200, 300],
+            "model__learning_rate": [0.05, 0.1, 0.2],
+            "model__max_depth": [None, 5, 10],
+            "model__min_samples_leaf": [20, 50, 100],
+        },
+        "LogisticRegression": {
+            "model__C": [0.01, 0.1, 1.0, 10.0, 100.0],
+        },
+        "Ridge": {
+            "model__alpha": [0.01, 0.1, 1.0, 10.0, 100.0],
+        },
+    }
+    return grids.get(model_name, {})
+
+
+def tune_best_model(
+    training_payload: Dict[str, Any],
+    seed: int = 42,
+    is_classification: bool = True,
+) -> Dict[str, Any]:
+    """
+    Tune the best model from training_payload using RandomizedSearchCV.
+
+    Looks up a parameter grid for the best model by name, runs a randomised
+    search over that grid on the training data, then re-evaluates on the held-out
+    test set.  If no grid exists for the model (e.g. Dummy, SVC) the payload is
+    returned unchanged.
+
+    Args:
+        training_payload: dict returned by train_models()
+        seed: random seed for reproducibility
+        is_classification: True for classification tasks
+
+    Returns:
+        Updated training_payload with 'best' replaced by the tuned model.
+    """
+    best = training_payload.get("best", {})
+    model_name = best.get("name", "")
+    pipeline = best.get("pipeline")
+    X_train = training_payload.get("X_train")
+    y_train = training_payload.get("y_train")
+    X_test = training_payload.get("X_test")
+    y_test = training_payload.get("y_test")
+
+    if pipeline is None or X_train is None or y_train is None:
+        return training_payload
+
+    param_grid = _param_grid(model_name)
+    if not param_grid:
+        return training_payload
+
+    # Guard: need at least TUNE_CV_SPLITS × 2 samples to run CV safely
+    if len(y_train) < TUNE_CV_SPLITS * 2:
+        return training_payload
+
+    if is_classification:
+        cv = StratifiedKFold(n_splits=TUNE_CV_SPLITS, shuffle=True, random_state=seed)
+        scoring = "balanced_accuracy"
+    else:
+        cv = KFold(n_splits=TUNE_CV_SPLITS, shuffle=True, random_state=seed)
+        scoring = "r2"
+
+    search = RandomizedSearchCV(
+        pipeline,
+        param_distributions=param_grid,
+        n_iter=TUNE_N_ITER,
+        scoring=scoring,
+        cv=cv,
+        random_state=seed,
+        n_jobs=-1,
+        refit=True,
+    )
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        search.fit(X_train, y_train)
+
+    tuned_pipeline = search.best_estimator_
+    y_pred = tuned_pipeline.predict(X_test)
+
+    if is_classification:
+        metrics = {
+            "model": model_name,
+            "accuracy": float(accuracy_score(y_test, y_pred)),
+            "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
+            "f1_macro": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
+            "precision_macro": float(precision_score(y_test, y_pred, average="macro", zero_division=0)),
+            "recall_macro": float(recall_score(y_test, y_pred, average="macro", zero_division=0)),
+        }
+    else:
+        metrics = {
+            "model": model_name,
+            "r2": float(r2_score(y_test, y_pred)),
+            "mae": float(mean_absolute_error(y_test, y_pred)),
+            "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
+        }
+
+    tuned_best = {
+        **best,
+        "pipeline": tuned_pipeline,
+        "metrics": metrics,
+        "y_pred": y_pred,
+        "tuned": True,
+        "best_params": search.best_params_,
+    }
+
+    # Reflect the tuned result back into the results list
+    updated_results = []
+    for r in training_payload.get("results", []):
+        if r.get("name") == model_name:
+            updated_results.append({**r, **tuned_best})
+        else:
+            updated_results.append(r)
+
+    return {
+        **training_payload,
+        "best": tuned_best,
+        "results": updated_results,
+        "all_metrics": [r["metrics"] for r in updated_results],
     }

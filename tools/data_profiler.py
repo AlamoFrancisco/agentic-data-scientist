@@ -1,9 +1,41 @@
+"""
+Data Profiler
+
+Dataset characterisation signals used by the Planner to make adaptive decisions.
+
+Implemented:
+- profile_dataset: orchestrates all signals into a single profile dict consumed
+  by the Planner; includes schema, feature types, missing %, class counts,
+  imbalance ratio, near-constant cols, outlier cols, correlation pairs, and notes
+- scale_range_report: detects scale mismatch when max_range / median_range ≥ 50
+- leakage_report: mutual-information leakage detection; classification uses
+  entropy normalisation, regression uses max-MI normalisation; returns normalised
+  MI score per feature
+- infer_target_column: heuristic target inference with return_scores=True support
+  and failed-target awareness (skips previously failed columns)
+- dataset_fingerprint: SHA-256 hash of shape + sorted column names + target,
+  used as the primary memory key
+- Near-constant column detection (≥95% dominant value)
+- Outlier column detection (>5% of values outside 1.5×IQR)
+- High-correlation pair detection with configurable threshold
+"""
+
 import hashlib
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
+from scipy.stats import pearsonr
+
+from config import (
+    IMBALANCE_THRESHOLD,
+    NEAR_CONSTANT_THRESHOLD,
+    OUTLIER_FRACTION_THRESHOLD,
+    LEAKAGE_MI_THRESHOLD,
+    HIGH_CORR_THRESHOLD,
+    SMALL_DATASET_ROWS,
+)
 
 NUMERIC_SCHEMA_TYPES = {"ordinal", "continuous"}
 
@@ -170,7 +202,7 @@ def dataset_fingerprint(df: pd.DataFrame, target: str, file_path: str = "") -> s
     base = f"{file_path}|{target}|{cols}"
     return "fp_" + hashlib.md5(base.encode()).hexdigest()[:12]
 
-def detect_near_constant(df: pd.DataFrame, threshold: float = 0.95) -> List[str]:
+def detect_near_constant(df: pd.DataFrame, threshold: float = NEAR_CONSTANT_THRESHOLD) -> List[str]:
     """
     Return columns where a single value appears in >= threshold fraction of rows.
     These carry almost no signal and can cause issues with one-hot encoding.
@@ -184,7 +216,7 @@ def detect_near_constant(df: pd.DataFrame, threshold: float = 0.95) -> List[str]
     return near_const
 
 
-def detect_outliers(df: pd.DataFrame, numeric_cols: List[str], threshold: float = 0.05) -> List[str]:
+def detect_outliers(df: pd.DataFrame, numeric_cols: List[str], threshold: float = OUTLIER_FRACTION_THRESHOLD) -> List[str]:
     """
     Return numeric columns where more than `threshold` fraction of values fall
     outside the IQR fence (Q1 - 1.5*IQR, Q3 + 1.5*IQR).
@@ -230,6 +262,17 @@ def correlation_report(
             v = float(corr.loc[a, b])
             av = abs(v)
 
+            valid = df[[a, b]].dropna()
+            pair_n = int(len(valid))
+            if pair_n >= 3:
+                try:
+                    _, p_value = pearsonr(valid[a], valid[b])
+                    p_value = float(p_value)
+                except Exception:
+                    p_value = None
+            else:
+                p_value = None
+
             if av < min_abs_corr:
                 continue
 
@@ -238,6 +281,8 @@ def correlation_report(
                 "col_b": b,
                 "corr": float(round(v, 4)),
                 "abs_corr": float(round(av, 4)),
+                "n": pair_n,
+                "p_value": None if p_value is None else float(round(p_value, 6)),
             })
 
     pairs.sort(key=lambda d: d["abs_corr"], reverse=True)
@@ -313,12 +358,78 @@ def build_feature_types(
     }
 
 
+def _normalise_for_leakage(series: pd.Series, schema_type: str) -> pd.Series:
+    if schema_type in ("categorical", "text", "boolean", "all_missing"):
+        return series.astype(str).str.strip().str.lower()
+    numeric = pd.to_numeric(series, errors="coerce")
+    return numeric
+
+
+def _detect_hard_leakage(
+    df: pd.DataFrame,
+    target: str,
+    schema: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """
+    Detect hard leakage evidence that is strong enough to invalidate a run:
+    - exact copies of the target
+    - low-cardinality deterministic remappings of the target (e.g. yes/no for 0/1)
+    """
+    hard: List[Dict[str, Any]] = []
+    target_schema = schema.get(target, "categorical")
+    target_norm = _normalise_for_leakage(df[target], target_schema)
+    target_valid = target_norm.dropna()
+    target_unique = int(target_valid.nunique(dropna=True))
+
+    for col in df.columns:
+        if col == target:
+            continue
+
+        feature_schema = schema.get(col, "categorical")
+        feature_norm = _normalise_for_leakage(df[col], feature_schema)
+
+        exact_valid = pd.concat([feature_norm, target_norm], axis=1).dropna()
+        if not exact_valid.empty and exact_valid.iloc[:, 0].equals(exact_valid.iloc[:, 1]):
+            hard.append({
+                "column": col,
+                "evidence_level": "hard",
+                "reason": "exact_target_copy",
+            })
+            continue
+
+        if exact_valid.empty:
+            continue
+
+        feature_unique = int(exact_valid.iloc[:, 0].nunique(dropna=True))
+        if feature_unique < 2:
+            continue
+
+        # Restrict deterministic mapping detection to low-cardinality features so
+        # ID-like columns are not misclassified as hard leakage.
+        max_allowed_unique = max(20, target_unique * 4 if target_unique > 0 else 20)
+        if feature_unique > max_allowed_unique:
+            continue
+
+        mapping_counts = exact_valid.groupby(exact_valid.columns[0])[exact_valid.columns[1]].nunique(dropna=True)
+        reverse_counts = exact_valid.groupby(exact_valid.columns[1])[exact_valid.columns[0]].nunique(dropna=True)
+        deterministic = bool((mapping_counts <= 1).all() and (reverse_counts <= 1).all())
+        if deterministic:
+            hard.append({
+                "column": col,
+                "evidence_level": "hard",
+                "reason": "deterministic_target_mapping",
+            })
+
+    hard.sort(key=lambda item: item["column"])
+    return hard
+
+
 def leakage_report(
     df: pd.DataFrame,
     target: str,
     schema: Dict[str, str],
     is_classification: bool = True,
-    threshold: float = 0.9,
+    threshold: float = LEAKAGE_MI_THRESHOLD,
 ) -> List[Dict[str, Any]]:
     """
     Detect potentially leaky features using mutual information.
@@ -326,6 +437,10 @@ def leakage_report(
     Flags features where normalised MI >= threshold (default 0.9).
     """
     feature_cols = [c for c in df.columns if c != target]
+    hard_leakage = _detect_hard_leakage(df, target, schema)
+    hard_cols = {item["column"] for item in hard_leakage}
+    feature_cols = [c for c in feature_cols if c not in hard_cols]
+
     y = df[target].copy()
     X = df[feature_cols].copy()
 
@@ -339,23 +454,29 @@ def leakage_report(
 
     # Encode target — classification uses label-encoded integers;
     # regression uses raw values so MI reflects actual continuous relationships
-    if is_classification:
-        y_encoded = pd.factorize(y)[0]
-        mi_scores = mutual_info_classif(X, y_encoded, random_state=42)
-        # Normalise by target entropy (meaningful for discrete targets)
-        vc = pd.Series(y_encoded).value_counts(normalize=True)
-        target_entropy = float(-np.sum(vc * np.log(vc + 1e-10)))
-        if target_entropy == 0:
-            return []
-        normaliser = target_entropy
+    if feature_cols:
+        if is_classification:
+            y_encoded = pd.factorize(y)[0]
+            mi_scores = mutual_info_classif(X, y_encoded, random_state=42)
+            # Normalise by target entropy (meaningful for discrete targets)
+            vc = pd.Series(y_encoded).value_counts(normalize=True)
+            target_entropy = float(-np.sum(vc * np.log(vc + 1e-10)))
+            if target_entropy == 0:
+                mi_scores = np.array([])
+                normaliser = 1.0
+            else:
+                normaliser = target_entropy
+        else:
+            y_encoded = y.astype(float).values
+            mi_scores = mutual_info_regression(X, y_encoded, random_state=42)
+            # Normalise by max MI score — keeps threshold scale-invariant for regression
+            max_mi = float(np.max(mi_scores)) if np.max(mi_scores) > 0 else 1.0
+            normaliser = max_mi
     else:
-        y_encoded = y.astype(float).values
-        mi_scores = mutual_info_regression(X, y_encoded, random_state=42)
-        # Normalise by max MI score — keeps threshold scale-invariant for regression
-        max_mi = float(np.max(mi_scores)) if np.max(mi_scores) > 0 else 1.0
-        normaliser = max_mi
+        mi_scores = np.array([])
+        normaliser = 1.0
 
-    leaky = []
+    leaky = list(hard_leakage)
     for col, score in zip(feature_cols, mi_scores):
         normalised = float(score) / normaliser
         if normalised >= threshold:
@@ -363,9 +484,18 @@ def leakage_report(
                 "column": col,
                 "mi_score": round(float(score), 4),
                 "normalised_mi": round(normalised, 4),
+                "evidence_level": "soft",
+                "reason": "high_mutual_information",
             })
 
-    leaky.sort(key=lambda x: x["normalised_mi"], reverse=True)
+    def _sort_key(item: Dict[str, Any]) -> Any:
+        return (
+            0 if item.get("evidence_level") == "hard" else 1,
+            -float(item.get("normalised_mi", 0.0)),
+            item.get("column", ""),
+        )
+
+    leaky.sort(key=_sort_key)
     return leaky
 
 
@@ -406,7 +536,14 @@ def scale_range_report(df: pd.DataFrame, schema: Dict[str, str]) -> Dict[str, An
     }
 
 
-def profile_dataset(df: pd.DataFrame, target: str, target_source: str = "inferred", target_candidate_scores: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+def profile_dataset(
+    df: pd.DataFrame,
+    target: str,
+    target_source: str = "inferred",
+    target_candidate_scores: Optional[Dict[str, float]] = None,
+    duplicate_count: Optional[int] = None,
+    original_row_count: Optional[int] = None,
+) -> Dict[str, Any]:
     if target not in df.columns:
         raise ValueError(f"Target column '{target}' not found in dataset columns.")
 
@@ -432,7 +569,7 @@ def profile_dataset(df: pd.DataFrame, target: str, target_source: str = "inferre
     profile["feature_types"] = build_feature_types(profile["schema"], profile["n_unique_by_col"], target)
 
     notes = []
-    if profile["shape"]["rows"] < 1000:
+    if profile["shape"]["rows"] < SMALL_DATASET_ROWS:
         notes.append("Small dataset (<1000 rows): prefer simpler models / guard against overfitting.")
     if profile["shape"]["cols"] > 100:
         notes.append("High dimensionality (>100 columns): watch one-hot expansion and overfitting.")
@@ -455,10 +592,12 @@ def profile_dataset(df: pd.DataFrame, target: str, target_source: str = "inferre
             "These may represent ordered levels rather than continuous measurements."
         )
 
-    # Duplicate detection — adapted from EDA notebook
-    dup_count = int(df.duplicated().sum())
+    # Duplicate detection — when the orchestrator has already deduplicated the
+    # frame, it passes the original duplicate count so reporting stays truthful.
+    dup_count = int(df.duplicated().sum()) if duplicate_count is None else int(duplicate_count)
+    duplicate_denominator = int(original_row_count) if original_row_count is not None else len(df)
     profile["duplicate_count"] = dup_count
-    profile["duplicate_pct"] = round(dup_count / max(len(df), 1) * 100, 2)
+    profile["duplicate_pct"] = round(dup_count / max(duplicate_denominator, 1) * 100, 2)
     if dup_count > 0:
         notes.append(f"Found {dup_count} duplicate rows ({profile['duplicate_pct']}%): dropped before training.")
 
@@ -478,9 +617,14 @@ def profile_dataset(df: pd.DataFrame, target: str, target_source: str = "inferre
 
     leaky = leakage_report(df, target, profile["schema"], is_classification=profile["is_classification"])
     profile["leaky_cols"] = leaky
-    if leaky:
-        names = [c["column"] for c in leaky]
-        notes.append(f"Potential leakage detected in: {names}. Check before training.")
+    profile["hard_leakage_cols"] = [item for item in leaky if item.get("evidence_level") == "hard"]
+    profile["soft_leakage_cols"] = [item for item in leaky if item.get("evidence_level") != "hard"]
+    if profile["hard_leakage_cols"]:
+        names = [c["column"] for c in profile["hard_leakage_cols"]]
+        notes.append(f"Hard leakage evidence detected in: {names}. Review before trusting the run.")
+    elif profile["soft_leakage_cols"]:
+        names = [c["column"] for c in profile["soft_leakage_cols"]]
+        notes.append(f"Potential target-proxy risk detected in: {names}. Human review recommended.")
 
     sr = scale_range_report(df, profile["schema"])
     profile["scale_range"] = sr["scale_range"]
@@ -489,12 +633,12 @@ def profile_dataset(df: pd.DataFrame, target: str, target_source: str = "inferre
     if sr["scale_mismatch"]:
         notes.append(f"Scale mismatch detected (ratio={sr['scale_range_ratio']}x): consider robust scaling.")
 
-    cr = correlation_report(df, profile["schema"])
+    cr = correlation_report(df, profile["schema"], min_abs_corr=HIGH_CORR_THRESHOLD)
     profile["correlation"] = serialize_correlation_matrix(cr["corr"])
     profile["high_corr_pairs"] = cr["high_corr_pairs"]
     max_corr = max((p.get("abs_corr", 0.0) for p in profile["high_corr_pairs"]), default=0.0)
     profile["max_abs_corr"] = round(float(max_corr), 4)
-    profile["high_corr_present"] = profile["max_abs_corr"] >= 0.6
+    profile["high_corr_present"] = profile["max_abs_corr"] >= HIGH_CORR_THRESHOLD
 
     profile["notes"] = notes
 
@@ -507,8 +651,8 @@ def profile_dataset(df: pd.DataFrame, target: str, target_source: str = "inferre
         else:
             ratio = 1.0
         profile["imbalance_ratio"] = round(ratio, 3)
-        if ratio >= 3.0:
-            profile["notes"].append("Imbalance detected (ratio >= 3.0): prioritise macro metrics / balanced accuracy.")
+        if ratio >= IMBALANCE_THRESHOLD:
+            profile["notes"].append(f"Imbalance detected (ratio >= {IMBALANCE_THRESHOLD}): prioritise macro metrics / balanced accuracy.")
     else:
         profile["class_counts"] = None
         profile["imbalance_ratio"] = None

@@ -1,20 +1,37 @@
 """
-Planner Agent - Students must extend this significantly
+Planner Agent
 
-The planner analyzes dataset characteristics and generates an execution plan.
-Your task is to implement sophisticated planning logic that adapts to different
-dataset types, sizes, and characteristics.
+Analyses dataset characteristics and generates a tailored execution plan.
 
-TODO: Extend this module with:
-1. Sophisticated planning logic based on dataset profiles
-2. Different plan templates for different scenarios
-3. Memory-guided planning (use past successful strategies)
-4. Dependency management (task ordering)
-5. Conditional planning (if X then Y else Z)
-6. Fallback strategies for edge cases
+Implemented:
+- Size-bucket routing: small (<1000) → regularization + simple_models_only;
+  large (≥10000) → ensemble models
+- Scale mismatch detection → apply_robust_scaling
+- Mutual-information leakage detection → drop_leaky_features
+- Near-constant column detection → drop_near_constant_features
+- High-correlation feature pruning (abs_corr ≥ 0.95) → drop_correlated_features
+- High-cardinality categoricals and text columns → apply_target_encoding
+- Class imbalance (ratio ≥ 3.0) → consider_imbalance_strategy
+- Outlier-heavy columns → handle_outliers
+- Severe missing data (>20%) → handle_severe_missing_data
+- Memory-guided model prioritisation → prioritize_model:<name>
+
+TODO:
+- Plan templates per scenario (high-dimensional, time-series, etc.)
+- Cost-aware planning (estimate compute before committing)
+- Fallback strategies when initial plan produces no useful result
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from config import (
+    HIGH_CORR_DROP_THRESHOLD,
+    IMBALANCE_THRESHOLD,
+    LARGE_DATASET_ROWS,
+    MAX_OHE_UNIQUE,
+    SEVERE_MISSING_THRESHOLD,
+    SMALL_DATASET_ROWS,
+)
 
 
 def create_plan(
@@ -72,17 +89,17 @@ def create_plan(
     # TODO: Add sophisticated logic here
     # Example: Check for imbalance
     imb = dataset_profile.get("imbalance_ratio") or 1.0
-    if imb >= 3.0:
+    if imb >= IMBALANCE_THRESHOLD:
         # TODO: Make this more sophisticated
         # Consider: SMOTE, class weights, threshold tuning, etc.
         plan.insert(plan.index("train_models"), "consider_imbalance_strategy")
     
     # Size bucket — drives model complexity and regularization
     rows = dataset_profile["shape"]["rows"]
-    if rows < 1000:
+    if rows < SMALL_DATASET_ROWS:
         plan.append("apply_regularization")
         plan.append("use_simple_models_only")
-    elif rows >= 10000:
+    elif rows >= LARGE_DATASET_ROWS:
         plan.append("use_ensemble_models")
     
     # High-cardinality categoricals: check multiclass AND text columns.
@@ -92,16 +109,15 @@ def create_plan(
     categorical_cols = categorical_groups.get("binary", []) + categorical_groups.get("multiclass", [])
     text_cols = dataset_profile.get("feature_types", {}).get("text", [])
     n_unique = dataset_profile.get("n_unique_by_col", {})
-    high_card_cats = [c for c in categorical_cols if n_unique.get(c, 0) > 50]
-    # Text cols that look categorical: more than 50 unique values but under 10% of rows
+    high_card_cats = [c for c in categorical_cols if n_unique.get(c, 0) > MAX_OHE_UNIQUE]
+    # Text cols that look categorical: more unique values than MAX_OHE_UNIQUE but under 10% of rows
     high_card_text = [
         c for c in text_cols
-        if 50 < n_unique.get(c, 0) < rows * 0.10
+        if MAX_OHE_UNIQUE < n_unique.get(c, 0) < rows * 0.10
     ]
     if high_card_cats or high_card_text:
         plan.insert(plan.index("build_preprocessor"), "apply_target_encoding")
 
-    # TODO: Use memory hints
     if memory_hint and memory_hint.get("best_model"):
         plan.append(f"prioritize_model:{memory_hint['best_model']}")
     
@@ -110,21 +126,26 @@ def create_plan(
     if outlier_cols:
         plan.insert(plan.index("build_preprocessor"), "handle_outliers")
 
-    # TODO: Add logic based on missing data
     missing_pct = dataset_profile.get("missing_pct", {})
     if missing_pct:
         max_missing = max(missing_pct.values())
-        if max_missing > 20:
+        if max_missing > SEVERE_MISSING_THRESHOLD:
             plan.insert(plan.index("build_preprocessor"), "handle_severe_missing_data")
+
+    # Hyperparameter tuning: worthwhile for medium/large datasets where the
+    # extra compute is justified; skip for small datasets to stay fast.
+    if rows >= SMALL_DATASET_ROWS:
+        plan.insert(plan.index("evaluate"), "tune_hyperparameters")
 
     # Use robust scaling when scale mismatch detected
     if dataset_profile.get("scale_mismatch"):
         plan.insert(plan.index("build_preprocessor"), "apply_robust_scaling")
 
-    # Drop features with near-perfect mutual information with target — likely leaky
-    leaky_cols = [c["column"] for c in dataset_profile.get("leaky_cols", [])]
-    if leaky_cols:
-        dataset_profile["leaky_col_names"] = leaky_cols
+    # Automatically drop only hard leakage evidence. Soft leakage signals should
+    # trigger review, not silent feature removal.
+    hard_leaky_cols = [c["column"] for c in dataset_profile.get("hard_leakage_cols", [])]
+    if hard_leaky_cols:
+        dataset_profile["leaky_col_names"] = hard_leaky_cols
         plan.insert(plan.index("build_preprocessor"), "drop_leaky_features")
 
     # Drop near-constant features — they carry no signal and inflate one-hot encoding
@@ -135,7 +156,7 @@ def create_plan(
     # Drop highly correlated features (abs_corr >= 0.95) — likely redundant or leaky
     high_corr_pairs = dataset_profile.get("high_corr_pairs", [])
     cols_to_drop = list({
-        p["col_b"] for p in high_corr_pairs if p.get("abs_corr", 0) >= 0.95
+        p["col_b"] for p in high_corr_pairs if p.get("abs_corr", 0) >= HIGH_CORR_DROP_THRESHOLD
     })
     if cols_to_drop:
         dataset_profile["corr_cols_to_drop"] = cols_to_drop
@@ -145,9 +166,64 @@ def create_plan(
 
 
 
-# TODO: Add helper functions for planning
-# def create_small_dataset_plan(...):
-# def create_imbalanced_dataset_plan(...):
-# def create_high_dimensional_plan(...):
-# def select_preprocessing_strategy(...):
-# def estimate_plan_cost(...):  # For cost-aware planning
+def apply_replan_strategy(
+    plan: List[str],
+    dataset_profile: Dict[str, Any],
+    reflection: Dict[str, Any],
+) -> Tuple[List[str], Dict[str, Any]]:
+    """
+    Modify the plan and dataset profile based on reflection issues.
+
+    Called by the orchestrator when the reflector recommends a replan.
+    Each handler targets a specific issue string and makes a concrete change
+    that the executor or preprocessor will act on in the next pass.
+
+    Args:
+        plan: Current execution plan
+        dataset_profile: Current dataset profile
+        reflection: Reflection output including issues list
+
+    Returns:
+        Tuple of (modified_plan, modified_profile)
+    """
+    new_plan = list(plan)
+    new_profile = dict(dataset_profile)
+
+    notes = list(new_profile.get("notes", []))
+    notes.append("Replan: adjusting strategy after reflection.")
+    new_profile["notes"] = notes
+
+    issues = reflection.get("issues", [])
+    issues_lower = " ".join(issues).lower()
+
+    # Overfitting: strengthen regularization
+    if "overfitting" in issues_lower:
+        if "apply_regularization" not in new_plan:
+            new_plan.insert(new_plan.index("train_models"), "apply_regularization")
+
+    # Severe imbalance with weak baseline margin: ensure class weights are applied
+    if "imbalance" in issues_lower:
+        if "consider_imbalance_strategy" not in new_plan:
+            new_plan.insert(new_plan.index("train_models"), "consider_imbalance_strategy")
+
+    # Low F1 or weak-vs-baseline: switch to ensemble models for more predictive power
+    if "f1" in issues_lower or "baseline" in issues_lower:
+        if "use_ensemble_models" not in new_plan:
+            new_plan.append("use_ensemble_models")
+
+    # Numerical instability: apply robust scaling if not already planned
+    if "instability" in issues_lower or "scaling" in issues_lower:
+        if "apply_robust_scaling" not in new_plan:
+            new_plan.insert(new_plan.index("build_preprocessor"), "apply_robust_scaling")
+
+    # CV gap: held-out score diverges from cross-validation mean.
+    # Strengthen regularization to reduce variance between splits, and widen
+    # the test set so the held-out estimate is more representative.
+    if "cross-validation mean" in issues_lower:
+        if "apply_regularization" not in new_plan:
+            new_plan.insert(new_plan.index("train_models"), "apply_regularization")
+        new_profile["increase_test_size"] = True
+
+    new_plan.append("replan_attempt")
+
+    return new_plan, new_profile

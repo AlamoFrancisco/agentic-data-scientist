@@ -172,6 +172,12 @@ def test_correlation_report_detects_high_correlation_pairs():
         {pair["col_a"], pair["col_b"]} == {"a", "b"} and pair["abs_corr"] == 1.0
         for pair in result["high_corr_pairs"]
     )
+    ab_pair = next(
+        pair for pair in result["high_corr_pairs"]
+        if {pair["col_a"], pair["col_b"]} == {"a", "b"}
+    )
+    assert ab_pair["n"] == 30
+    assert ab_pair["p_value"] == 0.0
 
 
 # ── profile_dataset ───────────────────────────────────────────────────────────
@@ -240,6 +246,19 @@ def test_profile_dataset_small_dataset_note():
     assert any("1000" in n or "mall" in n for n in profile["notes"])
 
 
+def test_profile_dataset_uses_provided_duplicate_stats_for_reporting():
+    df = pd.DataFrame({"a": [1, 2, 3, 4], "target": [0, 1, 0, 1]})
+    profile = profile_dataset(
+        df,
+        "target",
+        duplicate_count=2,
+        original_row_count=6,
+    )
+    assert profile["duplicate_count"] == 2
+    assert profile["duplicate_pct"] == 33.33
+    assert any("Found 2 duplicate rows (33.33%)" in note for note in profile["notes"])
+
+
 def test_profile_dataset_missing_column_raises():
     df = pd.DataFrame({"a": [1, 2, 3]})
     with pytest.raises(ValueError, match="not found"):
@@ -289,3 +308,35 @@ def test_profile_dataset_adds_correlation_signals():
         {pair["col_a"], pair["col_b"]} == {"a", "b"}
         for pair in profile["high_corr_pairs"]
     )
+
+
+def test_profile_dataset_marks_exact_target_copy_as_hard_leakage():
+    df = pd.DataFrame(
+        {
+            "alive": ["yes", "no", "yes", "no", "yes", "no"],
+            "survived": [1, 0, 1, 0, 1, 0],
+        }
+    )
+
+    profile = profile_dataset(df, "survived")
+
+    assert any(item["column"] == "alive" for item in profile["hard_leakage_cols"])
+    assert any(item["column"] == "alive" for item in profile["leaky_cols"])
+    assert not any(item["column"] == "alive" for item in profile["soft_leakage_cols"])
+
+
+def test_profile_dataset_marks_mi_only_leakage_as_soft_signal():
+    x = np.linspace(0, 1, 80)
+    y = np.digitize(x, bins=[0.25, 0.5, 0.75])
+    df = pd.DataFrame(
+        {
+            "bmi": x,
+            "noise": np.sin(x * 7),
+            "target": y,
+        }
+    )
+
+    profile = profile_dataset(df, "target")
+
+    assert any(item["column"] == "bmi" for item in profile["soft_leakage_cols"])
+    assert not any(item["column"] == "bmi" for item in profile["hard_leakage_cols"])

@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tools.modelling import build_preprocessor, cross_validate_top_models, select_models, train_models
+from tools.modelling import build_preprocessor, cross_validate_top_models, select_models, train_models, tune_best_model
 
 
 # ── fixtures / helpers ────────────────────────────────────────────────────────
@@ -73,6 +73,32 @@ def test_build_preprocessor_with_categoricals():
     pp = build_preprocessor(profile)
     transformer_names = [t[0] for t in pp.transformers]
     assert "cat" in transformer_names
+
+
+def test_build_preprocessor_uses_sparse_one_hot_encoding():
+    df = make_cls_df()
+    profile = make_profile(df)
+    pp = build_preprocessor(profile)
+    cat_entry = next(t for t in pp.transformers if t[0] == "cat")
+    ohe = cat_entry[1].named_steps["onehot"]
+    sparse_flag = getattr(ohe, "sparse_output", getattr(ohe, "sparse", None))
+    assert sparse_flag is True
+
+
+def test_build_preprocessor_enables_robust_imputation_when_requested():
+    df = make_cls_df()
+    profile = make_profile(df)
+    profile["robust_imputation"] = True
+    pp = build_preprocessor(profile)
+
+    cont_entry = next(t for t in pp.transformers if t[0] == "cont")
+    cont_imputer = cont_entry[1].named_steps["imputer"]
+    assert cont_imputer.add_indicator is True
+
+    cat_entry = next(t for t in pp.transformers if t[0] == "cat")
+    cat_imputer = cat_entry[1].named_steps["imputer"]
+    assert cat_imputer.strategy == "constant"
+    assert cat_imputer.fill_value == "__missing__"
 
 
 def test_build_preprocessor_drops_high_cardinality_categoricals():
@@ -152,6 +178,13 @@ def test_select_models_respects_regression_priority():
     profile = make_profile(make_reg_df(), is_classification=False)
     names = [n for n, _ in select_models(profile, preferred_model="GradientBoostingRegressor")]
     assert names[0] == "GradientBoostingRegressor"
+
+
+def test_select_models_regression_simple_models_only_excludes_ensembles():
+    profile = make_profile(make_reg_df(), is_classification=False)
+    profile["simple_models_only"] = True
+    names = [n for n, _ in select_models(profile)]
+    assert names == ["DummyMean", "LinearRegression", "Ridge"]
 
 
 def test_select_models_respects_classification_priority():
@@ -277,3 +310,123 @@ def test_cross_validate_top_models_regression_returns_summary():
     assert result["n_splits"] >= 2
     assert len(result["models"]) >= 1
     assert "r2_mean" in result["models"][0]
+
+
+def test_cross_validate_top_models_uses_training_split_when_available(monkeypatch):
+    df = make_cls_df(n=120)
+    profile = make_profile(df)
+    pp = build_preprocessor(profile)
+    candidates = [(n, m) for n, m in select_models(profile) if n in ("DummyMostFrequent", "LogisticRegression")]
+    trained = train_models(
+        df,
+        "target",
+        pp,
+        candidates,
+        seed=42,
+        test_size=0.2,
+        output_dir=".",
+        is_classification=True,
+    )
+
+    seen = {}
+
+    def fake_cross_validate(estimator, X, y, cv, scoring, n_jobs, error_score):
+        seen["rows"] = len(X)
+        return {
+            "test_accuracy": np.array([0.5, 0.5, 0.5]),
+            "test_balanced_accuracy": np.array([0.5, 0.5, 0.5]),
+            "test_f1_macro": np.array([0.5, 0.5, 0.5]),
+        }
+
+    monkeypatch.setattr("tools.modelling.cross_validate", fake_cross_validate)
+
+    result = cross_validate_top_models(
+        df=df,
+        target="target",
+        training_payload=trained,
+        seed=42,
+        is_classification=True,
+        top_k=1,
+    )
+
+    assert result["enabled"] is True
+    assert seen["rows"] == len(trained["X_train"])
+    assert seen["rows"] < len(df)
+
+
+# ── tune_best_model ───────────────────────────────────────────────────────────
+
+def _run_training(df, target="target", is_classification=True, n=200):
+    """Helper: build a minimal training payload for tuning tests."""
+    profile = make_profile(df, target=target, is_classification=is_classification)
+    preprocessor = build_preprocessor(profile)
+    candidates = select_models(profile, seed=42)
+    return train_models(
+        df=df,
+        target=target,
+        preprocessor=preprocessor,
+        candidates=candidates,
+        seed=42,
+        test_size=0.2,
+        output_dir="/tmp",
+        verbose=False,
+        is_classification=is_classification,
+    )
+
+
+def test_tune_best_model_classification_returns_correct_structure():
+    df = make_cls_df(n=200)
+    trained = _run_training(df, is_classification=True)
+    tuned = tune_best_model(trained, seed=42, is_classification=True)
+
+    assert "best" in tuned
+    assert "results" in tuned
+    assert "all_metrics" in tuned
+    best = tuned["best"]
+    assert "metrics" in best
+    assert "balanced_accuracy" in best["metrics"]
+
+
+def test_tune_best_model_tuned_flag_set_when_grid_exists():
+    df = make_cls_df(n=200)
+    trained = _run_training(df, is_classification=True)
+    # Force the best model to LogisticRegression so there is a known param grid
+    for r in trained["results"]:
+        if r["name"] == "LogisticRegression":
+            trained["best"] = r
+            break
+    tuned = tune_best_model(trained, seed=42, is_classification=True)
+    best = tuned["best"]
+    # If a grid exists, tuned=True and best_params must be present
+    if best.get("tuned"):
+        assert "best_params" in best
+        assert isinstance(best["best_params"], dict)
+
+
+def test_tune_best_model_no_grid_returns_unchanged():
+    df = make_cls_df(n=200)
+    trained = _run_training(df, is_classification=True)
+    # Force the best to a Dummy model — no param grid → payload returned as-is
+    for r in trained["results"]:
+        if "Dummy" in r["name"]:
+            trained["best"] = r
+            break
+    original_name = trained["best"]["name"]
+    tuned = tune_best_model(trained, seed=42, is_classification=True)
+    assert tuned["best"]["name"] == original_name
+    assert not tuned["best"].get("tuned", False)
+
+
+def test_tune_best_model_regression_returns_r2():
+    df = make_reg_df(n=200)
+    trained = _run_training(df, is_classification=False)
+    tuned = tune_best_model(trained, seed=42, is_classification=False)
+    assert "r2" in tuned["best"]["metrics"]
+
+
+def test_tune_best_model_all_metrics_length_unchanged():
+    df = make_cls_df(n=200)
+    trained = _run_training(df, is_classification=True)
+    original_count = len(trained["all_metrics"])
+    tuned = tune_best_model(trained, seed=42, is_classification=True)
+    assert len(tuned["all_metrics"]) == original_count

@@ -78,6 +78,33 @@ def test_get_dataset_record_require_reliable_returns_reliable_record(tmp_path):
     assert m.get_dataset_record("fp1", require_reliable=True) == {"best_model": "RF", "verdict_label": "Reliable result"}
 
 
+def test_get_dataset_record_allowed_target_origins_filters_records(tmp_path):
+    m = JSONMemory(path=str(tmp_path / "mem.json"))
+    m.data["datasets"]["fp1"] = {
+        "best_model": "RF",
+        "verdict_label": "Reliable result",
+        "target_source": "inferred",
+        "target_origin": "inferred",
+    }
+    assert m.get_dataset_record("fp1", require_reliable=True, allowed_target_origins=["manual"]) is None
+
+
+def test_get_dataset_record_allowed_target_origins_accepts_manual_record(tmp_path):
+    m = JSONMemory(path=str(tmp_path / "mem.json"))
+    m.data["datasets"]["fp1"] = {
+        "best_model": "RF",
+        "verdict_label": "Reliable result",
+        "target_source": "memory",
+        "target_origin": "manual",
+    }
+    assert m.get_dataset_record("fp1", require_reliable=True, allowed_target_origins=["manual"]) == {
+        "best_model": "RF",
+        "verdict_label": "Reliable result",
+        "target_source": "memory",
+        "target_origin": "manual",
+    }
+
+
 def test_upsert_persists_and_is_retrievable(tmp_path):
     path = tmp_path / "mem.json"
     m = JSONMemory(path=str(path))

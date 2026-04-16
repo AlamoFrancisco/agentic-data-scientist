@@ -1,3 +1,21 @@
+"""
+Evaluation Tools
+
+Metrics computation, reporting, and run-verdict logic.
+
+Implemented:
+- evaluate_best: computes classification (accuracy, balanced accuracy, macro F1/precision/recall)
+  and regression (R², MAE, RMSE) metrics; saves confusion matrix or predicted-vs-actual plot;
+  per_class_f1 added to every entry in all_metrics (classification) for consistent schema;
+  saves feature importance bar chart (tree-based models) and per-class F1 bar chart (classification)
+- derive_run_verdict: classifies each run as "Reliable result", "Use with caution", or
+  "Invalid due to leakage risk" based on hard leakage evidence, reflection issues, and CV stability
+- write_markdown_report: full human-readable run summary including dataset profile, adaptive
+  plan, metrics table, cross-validation section, reflection issues, and confidence-aware summary;
+  Artefacts section includes confusion matrix, predicted-vs-actual, feature importance, per-class F1
+- cross_validation_section: tabulates per-model fold means and standard deviations
+"""
+
 import os
 import json
 from dataclasses import asdict
@@ -11,6 +29,16 @@ import matplotlib.pyplot as plt
 
 from sklearn.metrics import confusion_matrix, classification_report
 from sklearn.utils.multiclass import unique_labels
+
+from config import (
+    CV_GAP_THRESHOLD_CLS,
+    CV_GAP_THRESHOLD_REG,
+    CV_STD_THRESHOLD_CLS,
+    CV_STD_THRESHOLD_REG,
+    F1_THRESHOLD_BALANCED,
+    FEATURE_IMPORTANCE_THRESHOLD,
+    HIGH_CORR_THRESHOLD,
+)
 
 
 def save_json(path: str, obj: Any) -> None:
@@ -58,6 +86,65 @@ def plot_predicted_vs_actual(y_test: Any, y_pred: Any, out_path: str, title: str
     plt.close()
 
 
+def plot_feature_importance(pipeline: Any, out_path: str, title: str, top_n: int = 15) -> Optional[str]:
+    """
+    Horizontal bar chart of the top-N feature importances from the best model.
+    Returns the saved path, or None if the model does not support feature_importances_.
+    """
+    try:
+        model = pipeline.named_steps["model"]
+        importances = model.feature_importances_
+    except (AttributeError, KeyError):
+        return None
+
+    try:
+        preprocessor = pipeline.named_steps["preprocess"]
+        raw_names = list(preprocessor.get_feature_names_out())
+        # Strip transformer prefix: "cont__alcohol" → "alcohol", "cat__sex_Male" → "sex_Male"
+        feature_names = [n.split("__", 1)[-1] for n in raw_names]
+    except Exception:
+        feature_names = [f"f{i}" for i in range(len(importances))]
+
+    n = min(top_n, len(importances))
+    indices = np.argsort(importances)[-n:]
+    names = [feature_names[i] for i in indices]
+    values = importances[indices]
+
+    fig, ax = plt.subplots(figsize=(7, max(3, n * 0.45)))
+    colors = ["#d95f02" if v >= FEATURE_IMPORTANCE_THRESHOLD else "#1b9e77" for v in values]
+    ax.barh(range(n), values, color=colors)
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(names, fontsize=8)
+    ax.set_xlabel("Importance")
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close()
+    return out_path
+
+
+def plot_per_class_f1(per_class_f1: Dict[str, float], out_path: str, title: str) -> str:
+    """
+    Horizontal bar chart of per-class F1 scores for the best model.
+    Bars below F1_THRESHOLD_BALANCED are shown in red to highlight weak classes.
+    """
+    classes = list(per_class_f1.keys())
+    scores = [per_class_f1[c] for c in classes]
+
+    fig, ax = plt.subplots(figsize=(6, max(3, len(classes) * 0.55)))
+    colors = ["#d62728" if s < F1_THRESHOLD_BALANCED else "#2ca02c" for s in scores]
+    ax.barh(classes, scores, color=colors)
+    ax.axvline(x=F1_THRESHOLD_BALANCED, color="grey", linestyle="--", linewidth=0.8, label="F1_THRESHOLD_BALANCED threshold")
+    ax.set_xlim(0, 1.05)
+    ax.set_xlabel("F1 Score")
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close()
+    return out_path
+
+
 def _ordered_class_labels(y_true: Any, y_pred: Any) -> List[Any]:
     """Return one canonical class order for both metrics and plotting."""
     return list(unique_labels(y_true, y_pred))
@@ -90,7 +177,7 @@ def _humanize_plan_step(step: str) -> Optional[str]:
         "drop_leaky_features": "Drop suspected leaky features before training.",
         "use_simple_models_only": "Restrict the search to simpler models.",
         "use_ensemble_models": "Favor ensemble models for a larger dataset.",
-        "try_ensemble_methods": "Expand the replan with additional ensemble methods.",
+        "tune_hyperparameters": "Tune the best model's hyperparameters with randomized search.",
     }
     return mapping.get(step, step.replace("_", " ").capitalize() + ".")
 
@@ -137,8 +224,8 @@ def _report_data_quality(profile: Dict[str, Any]) -> List[str]:
     near_const = profile.get("near_constant_cols", [])
     outlier_cols = profile.get("outlier_cols", [])
     missing_pct = profile.get("missing_pct", {})
-    leaky_cols = profile.get("leaky_cols", [])
-    high_corr_pairs = profile.get("high_corr_pairs", [])
+    hard_leakage = profile.get("hard_leakage_cols", [])
+    soft_leakage = profile.get("soft_leakage_cols", [])
 
     lines: List[str] = []
 
@@ -159,13 +246,20 @@ def _report_data_quality(profile: Dict[str, Any]) -> List[str]:
     if outlier_cols:
         lines.append(f"Outlier-heavy columns (>5% IQR): `{'`, `'.join(outlier_cols[:5])}`.")
 
-    strongest_corr = next((pair for pair in high_corr_pairs if pair.get("abs_corr", 0.0) >= 0.6), None)
+    strongest_corr = _strongest_high_corr_pair(profile)
     if strongest_corr:
-        lines.append(
+        corr_text = (
             "High correlation detected between "
             f"`{strongest_corr['col_a']}` and `{strongest_corr['col_b']}` "
-            f"(|r|={strongest_corr['abs_corr']:.2f})."
+            f"(r={strongest_corr.get('corr', 0.0):.2f}"
         )
+        if strongest_corr.get("n") is not None:
+            corr_text += f", n={strongest_corr['n']}"
+        p_value = strongest_corr.get("p_value")
+        if p_value is not None:
+            corr_text += ", p<0.001" if p_value < 0.001 else f", p={p_value:.3f}"
+        corr_text += "). Correlation does not imply causation."
+        lines.append(corr_text)
 
     if profile.get("scale_mismatch"):
         lines.append(
@@ -173,9 +267,34 @@ def _report_data_quality(profile: Dict[str, Any]) -> List[str]:
             f"(range ratio {profile.get('scale_range_ratio', 'N/A')}x)."
         )
 
-    if leaky_cols:
-        flagged = ", ".join(f"`{item['column']}`" for item in leaky_cols[:5])
-        lines.append(f"Potential leakage flagged for: {flagged}.")
+    if hard_leakage:
+        evidence = []
+        for item in hard_leakage[:5]:
+            column = item.get("column")
+            if not column:
+                continue
+            reason = item.get("reason")
+            if reason == "exact_target_copy":
+                evidence.append(f"`{column}` (exact target copy)")
+            elif reason == "deterministic_target_mapping":
+                evidence.append(f"`{column}` (deterministic target mapping)")
+            else:
+                evidence.append(f"`{column}`")
+        flagged = ", ".join(evidence)
+        lines.append(f"Hard leakage evidence flagged for: {flagged}.")
+    elif soft_leakage:
+        evidence = []
+        for item in soft_leakage[:5]:
+            column = item.get("column")
+            if not column:
+                continue
+            norm_mi = item.get("normalised_mi")
+            if norm_mi is not None:
+                evidence.append(f"`{column}` (normalised MI {float(norm_mi):.2f})")
+            else:
+                evidence.append(f"`{column}`")
+        flagged = ", ".join(evidence)
+        lines.append(f"Potential leakage flagged for: {flagged}. Human review recommended before trusting the result.")
 
     if not lines:
         lines.append("No major data quality risks were detected by the profiler.")
@@ -193,7 +312,7 @@ def _report_profiler_notes(profile: Dict[str, Any], replan_attempted: bool) -> L
 
 def _strongest_high_corr_pair(profile: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return next(
-        (pair for pair in profile.get("high_corr_pairs", []) if pair.get("abs_corr", 0.0) >= 0.9),
+        (pair for pair in profile.get("high_corr_pairs", []) if pair.get("abs_corr", 0.0) >= HIGH_CORR_THRESHOLD),
         None,
     )
 
@@ -218,17 +337,17 @@ def _cv_alert(eval_payload: Dict[str, Any]) -> Optional[str]:
     if "balanced_accuracy_mean" in cv_entry:
         gap = abs(float(best.get("balanced_accuracy", 0.0)) - float(cv_entry.get("balanced_accuracy_mean", 0.0)))
         std = float(cv_entry.get("balanced_accuracy_std", 0.0))
-        if gap > 0.08:
+        if gap > CV_GAP_THRESHOLD_CLS:
             return "Held-out performance differs materially from the cross-validation estimate."
-        if std > 0.05:
+        if std > CV_STD_THRESHOLD_CLS:
             return "Cross-validation performance is unstable across folds."
         return None
 
     gap = abs(float(best.get("r2", 0.0)) - float(cv_entry.get("r2_mean", 0.0)))
     std = float(cv_entry.get("r2_std", 0.0))
-    if gap > 0.15:
+    if gap > CV_GAP_THRESHOLD_REG:
         return "Held-out regression performance differs materially from the cross-validation estimate."
-    if std > 0.10:
+    if std > CV_STD_THRESHOLD_REG:
         return "Cross-validation regression performance is unstable across folds."
     return None
 
@@ -239,62 +358,79 @@ def derive_run_verdict(
     reflection: Dict[str, Any],
 ) -> Dict[str, str]:
     best = eval_payload.get("best_metrics", {})
-    issues = reflection.get("issues", []) if reflection else []
-    suggestions = reflection.get("suggestions", []) if reflection else []
     training_warnings = reflection.get("training_warnings", []) if reflection else []
-    all_reflection_text = [*issues, *suggestions]
     best_model = str(best.get("model", ""))
+    hard_leakage = dataset_profile.get("hard_leakage_cols", [])
+    soft_leakage = dataset_profile.get("soft_leakage_cols", [])
 
-    if dataset_profile.get("leaky_cols"):
+    if hard_leakage and not dataset_profile.get("drop_leaky"):
+        evidence = []
+        for item in hard_leakage[:5]:
+            column = item.get("column")
+            if not column:
+                continue
+            reason = item.get("reason")
+            if reason == "exact_target_copy":
+                evidence.append(f"`{column}` (exact target copy)")
+            elif reason == "deterministic_target_mapping":
+                evidence.append(f"`{column}` (deterministic target mapping)")
+            else:
+                evidence.append(f"`{column}`")
+        detail = "The profiler found hard target-leakage evidence."
+        if evidence:
+            detail = (
+                "The profiler found hard target-leakage evidence in "
+                + ", ".join(evidence)
+                + "."
+            )
         return {
             "label": "Invalid due to leakage risk",
-            "detail": "The profiler flagged one or more features as likely target leakage.",
+            "detail": detail,
         }
 
-    leakage_keywords = [
-        "leak",
-        "target proxy",
-        "target proxies",
-        "deterministically map",
-        "suspicious",
-    ]
-    if _contains_keyword(all_reflection_text, leakage_keywords):
+    if soft_leakage and not dataset_profile.get("drop_leaky"):
+        evidence = []
+        for item in soft_leakage[:5]:
+            column = item.get("column")
+            if not column:
+                continue
+            norm_mi = item.get("normalised_mi")
+            if norm_mi is not None:
+                evidence.append(f"`{column}` (normalised MI {float(norm_mi):.2f})")
+            else:
+                evidence.append(f"`{column}`")
+        detail = "The profiler raised soft leakage suspicion. Human review is recommended before trusting this result."
+        if evidence:
+            detail = (
+                "The profiler raised soft leakage suspicion in "
+                + ", ".join(evidence)
+                + ". Human review is recommended before trusting this result."
+            )
         return {
-            "label": "Invalid due to leakage risk",
-            "detail": "The reflection step flagged suspicious performance or target-proxy leakage.",
-        }
-
-    strongest_corr = _strongest_high_corr_pair(dataset_profile)
-    if (
-        not dataset_profile.get("is_classification", True)
-        and float(best.get("r2", 0.0)) >= 0.999
-        and strongest_corr is not None
-    ):
-        return {
-            "label": "Invalid due to leakage risk",
-            "detail": (
-                "Near-perfect regression performance alongside extremely strong feature correlation "
-                f"(`{strongest_corr['col_a']}` vs `{strongest_corr['col_b']}`, |r|={strongest_corr['abs_corr']:.2f}) "
-                "suggests the target may be reconstructable from the inputs."
-            ),
+            "label": "Use with caution",
+            "detail": detail,
         }
 
     cv_warning = _cv_alert(eval_payload)
     if cv_warning:
         return {
             "label": "Use with caution",
-            "detail": cv_warning,
+            "detail": f"{cv_warning} Human review is recommended before trusting this result.",
         }
 
     if (
-        reflection.get("status") == "needs_attention"
+        reflection.get("review_required", False)
+        or reflection.get("status") == "needs_attention"
         or reflection.get("replan_recommended", False)
         or "Dummy" in best_model
         or bool(training_warnings)
     ):
+        detail = "The run completed, but the reflection step or training process raised signals that warrant follow-up."
+        if reflection.get("review_required", False):
+            detail = "The run completed, but a human should review the result before it is trusted."
         return {
             "label": "Use with caution",
-            "detail": "The run completed, but the reflection step or training process raised signals that warrant follow-up.",
+            "detail": detail,
         }
 
     return {
@@ -410,6 +546,8 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classifi
     y_test = best["y_test"]
     y_pred = best["y_pred"]
 
+    per_class_f1: Dict[str, float] = {}
+
     if is_classification:
         # Confusion matrix — classification only
         labels = _ordered_class_labels(y_test, y_pred)
@@ -417,19 +555,60 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classifi
         cm_path = os.path.join(output_dir, "confusion_matrix.png")
         plot_confusion_matrix(cm, [str(label) for label in labels], cm_path, f"Confusion Matrix: {best['name']}")
         cls_report = classification_report(y_test, y_pred, labels=labels, zero_division=0)
+        cls_report_dict = classification_report(y_test, y_pred, labels=labels, zero_division=0, output_dict=True)
+        per_class_f1 = {
+            str(label): float(cls_report_dict.get(str(label), {}).get("f1-score", 0.0))
+            for label in labels
+        }
+        # Per-class F1 bar chart
+        pcf_path = plot_per_class_f1(
+            per_class_f1,
+            os.path.join(output_dir, "per_class_f1.png"),
+            f"Per-Class F1: {best['name']}",
+        )
+        # Add per_class_f1 to every model entry so all_metrics has a consistent schema
+        enriched_all_metrics = []
+        for result in training_payload["results"]:
+            m = dict(result["metrics"])
+            r = classification_report(result["y_test"], result["y_pred"], labels=labels, zero_division=0, output_dict=True)
+            m["per_class_f1"] = {
+                str(label): float(r.get(str(label), {}).get("f1-score", 0.0))
+                for label in labels
+            }
+            enriched_all_metrics.append(m)
     else:
         # Regression — predicted vs actual scatter plot
         cm_path = None
         cls_report = None
+        pcf_path = None
         reg_plot_path = os.path.join(output_dir, "predicted_vs_actual.png")
         plot_predicted_vs_actual(y_test, y_pred, reg_plot_path, f"Predicted vs Actual: {best['name']}")
+        enriched_all_metrics = list(all_metrics)
+
+    # Feature importance bar chart — tree-based models only; returns None otherwise
+    pipeline = best.get("pipeline")
+    fi_path = (
+        plot_feature_importance(
+            pipeline,
+            os.path.join(output_dir, "feature_importance.png"),
+            f"Feature Importance: {best['name']}",
+        )
+        if pipeline is not None
+        else None
+    )
+
+    best_metrics = dict(best["metrics"])
+    if per_class_f1:
+        best_metrics["per_class_f1"] = per_class_f1
 
     return {
-        "best_metrics": best["metrics"],
-        "all_metrics": all_metrics,
+        "best_metrics": best_metrics,
+        "all_metrics": enriched_all_metrics,
         "confusion_matrix_path": cm_path,
         "classification_report": cls_report,
         "regression_plot_path": reg_plot_path if not is_classification else None,
+        "feature_importance_path": fi_path,
+        "per_class_f1_path": pcf_path if is_classification else None,
     }
 
 
@@ -509,6 +688,13 @@ def write_markdown_report(
     reflection_issues = reflection.get("issues", []) if reflection else []
     reflection_suggestions = reflection.get("suggestions", []) if reflection else []
     training_warnings = reflection.get("training_warnings", []) if reflection else []
+    sig_test = reflection.get("significance_test") if reflection else None
+    significance_row = ""
+    significance_section = "- No formal model-comparison test was produced."
+    if sig_test:
+        sig_label = "Yes" if sig_test["significant"] else "No"
+        significance_row = f"\n| Model comparison (paired t-test) | {sig_test['model_a']} vs {sig_test['model_b']}: p={sig_test['p_value']:.3f}, significant={sig_label} |"
+        significance_section = f"- {sig_test['note']}"
     verdict = derive_run_verdict(dataset_profile, eval_payload, reflection or {})
 
     # Confidence-aware summary sentence
@@ -638,7 +824,8 @@ def write_markdown_report(
 | Field | Value |
 |---|---|
 | Status | {reflection_status} |
-| Replan Recommended | {reflection.get("replan_recommended", False) if reflection else False} |
+| Replan Recommended | {reflection.get("replan_recommended", False) if reflection else False} |{significance_row}
+| Review Required | {reflection.get("review_required", False) if reflection else False} |
 
 ### Issues
 {reflection_issues_section}
@@ -646,12 +833,17 @@ def write_markdown_report(
 ### Suggested Next Steps
 {reflection_suggestions_section}
 
+### Model Comparison Check
+{significance_section}
+
 ### Training Warnings
 {training_warnings_section}
 
 ## Artefacts
 {f"![Confusion Matrix](confusion_matrix.png)" if eval_payload.get("confusion_matrix_path") else ""}
 {f"![Predicted vs Actual](predicted_vs_actual.png)" if eval_payload.get("regression_plot_path") else ""}
+{f"![Feature Importance](feature_importance.png)" if eval_payload.get("feature_importance_path") else ""}
+{f"![Per-Class F1](per_class_f1.png)" if eval_payload.get("per_class_f1_path") else ""}
 
 """
 

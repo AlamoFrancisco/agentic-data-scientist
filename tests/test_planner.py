@@ -153,3 +153,17 @@ def test_mild_missing_no_handler():
 def test_no_missing_no_handler():
     plan = create_plan(make_profile(missing_pct={}))
     assert "handle_severe_missing_data" not in plan
+
+
+def test_hard_leakage_adds_drop_leaky_features():
+    profile = make_profile(hard_leakage_cols=[{"column": "alive", "reason": "deterministic_target_mapping"}])
+    plan = create_plan(profile)
+    assert "drop_leaky_features" in plan
+    assert profile["leaky_col_names"] == ["alive"]
+
+
+def test_soft_leakage_does_not_auto_drop_features():
+    profile = make_profile(soft_leakage_cols=[{"column": "bmi", "normalised_mi": 1.0, "evidence_level": "soft"}])
+    plan = create_plan(profile)
+    assert "drop_leaky_features" not in plan
+    assert "leaky_col_names" not in profile

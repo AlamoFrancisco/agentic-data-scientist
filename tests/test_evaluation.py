@@ -28,20 +28,22 @@ class FakeCtx:
 def cls_payload():
     y_test = pd.Series([0, 1, 0, 1, 0, 1, 0, 1])
     y_pred = [0, 1, 0, 1, 0, 1, 0, 0]
-    return {
-        "best": {
-            "name": "RandomForest",
-            "metrics": {
-                "model": "RandomForest",
-                "accuracy": 0.875,
-                "balanced_accuracy": 0.857,
-                "f1_macro": 0.857,
-                "precision_macro": 0.875,
-                "recall_macro": 0.857,
-            },
-            "y_test": y_test,
-            "y_pred": y_pred,
+    best = {
+        "name": "RandomForest",
+        "metrics": {
+            "model": "RandomForest",
+            "accuracy": 0.875,
+            "balanced_accuracy": 0.857,
+            "f1_macro": 0.857,
+            "precision_macro": 0.875,
+            "recall_macro": 0.857,
         },
+        "y_test": y_test,
+        "y_pred": y_pred,
+    }
+    return {
+        "best": best,
+        "results": [best],
         "all_metrics": [{"model": "RandomForest", "accuracy": 0.875, "f1_macro": 0.857}],
     }
 
@@ -395,10 +397,10 @@ def test_write_markdown_report_shows_use_with_caution_verdict(tmp_path):
 def test_write_markdown_report_shows_invalid_due_to_leakage_risk_verdict(tmp_path):
     out = str(tmp_path / "report.md")
     payload = reg_payload()
-    payload["best"]["metrics"]["r2"] = 1.0
     eval_result = evaluate_best(payload, str(tmp_path), is_classification=False)
     profile = _reg_profile()
-    profile["high_corr_pairs"] = [{"col_a": "a", "col_b": "b", "abs_corr": 0.95}]
+    profile["hard_leakage_cols"] = [{"column": "b", "reason": "exact_target_copy", "evidence_level": "hard"}]
+    profile["leaky_cols"] = [{"column": "b", "reason": "exact_target_copy", "evidence_level": "hard"}]
     write_markdown_report(
         out_path=out, ctx=FakeCtx(), fingerprint="fp_invalid",
         dataset_profile=profile,
@@ -409,6 +411,53 @@ def test_write_markdown_report_shows_invalid_due_to_leakage_risk_verdict(tmp_pat
     content = open(out).read()
     assert "Invalid due to leakage risk" in content
     assert "should not be treated as trustworthy" in content
+    assert "exact target copy" in content
+
+
+def test_write_markdown_report_uses_caution_for_soft_leakage_and_review_required(tmp_path):
+    out = str(tmp_path / "report.md")
+    payload = reg_payload()
+    eval_result = evaluate_best(payload, str(tmp_path), is_classification=False)
+    profile = _reg_profile()
+    profile["soft_leakage_cols"] = [{"column": "bmi", "normalised_mi": 1.0, "evidence_level": "soft"}]
+    profile["leaky_cols"] = [{"column": "bmi", "normalised_mi": 1.0, "evidence_level": "soft"}]
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_soft_leak",
+        dataset_profile=profile,
+        plan=["profile_dataset", "train_models"],
+        eval_payload=eval_result,
+        reflection={"status": "needs_attention", "issues": ["Profiler flagged soft target-proxy risk in: `bmi` (normalised MI 1.00)."], "suggestions": ["Human review recommended before trusting this result."], "replan_recommended": False, "review_required": True, "training_warnings": []},
+    )
+    content = open(out).read()
+    assert "Use with caution" in content
+    assert "soft leakage suspicion" in content
+    assert "Human review is recommended" in content
+    assert "| Review Required | True |" in content
+
+
+def test_write_markdown_report_uses_caution_for_suspicious_performance_without_profiler_leakage(tmp_path):
+    out = str(tmp_path / "report.md")
+    payload = cls_payload()
+    payload["best"]["metrics"]["accuracy"] = 1.0
+    payload["best"]["metrics"]["balanced_accuracy"] = 1.0
+    payload["best"]["metrics"]["f1_macro"] = 1.0
+    eval_result = evaluate_best(payload, str(tmp_path), is_classification=True)
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_suspicious",
+        dataset_profile=_cls_profile(),
+        plan=["profile_dataset", "train_models"],
+        eval_payload=eval_result,
+        reflection={
+            "status": "needs_attention",
+            "issues": ["Near-perfect performance across multiple non-baseline models is suspicious."],
+            "suggestions": ["Inspect features for target proxies, leakage, or columns that deterministically map to the target."],
+            "replan_recommended": False,
+            "training_warnings": [],
+        },
+    )
+    content = open(out).read()
+    assert "Use with caution" in content
+    assert "Invalid due to leakage risk" not in content
 
 
 def test_write_markdown_report_filters_internal_replan_step_and_surfaces_quality_risks(tmp_path):
@@ -416,7 +465,7 @@ def test_write_markdown_report_filters_internal_replan_step_and_surfaces_quality
     payload = cls_payload()
     eval_result = evaluate_best(payload, str(tmp_path), is_classification=True)
     profile = _cls_profile()
-    profile["high_corr_pairs"] = [{"col_a": "a", "col_b": "b", "abs_corr": 0.94}]
+    profile["high_corr_pairs"] = [{"col_a": "a", "col_b": "b", "corr": 0.94, "abs_corr": 0.94, "n": 100, "p_value": 0.0002}]
     profile["high_corr_present"] = True
     profile["notes"] = ["Ordinal-like numeric columns detected."]
     write_markdown_report(
@@ -429,4 +478,36 @@ def test_write_markdown_report_filters_internal_replan_step_and_surfaces_quality
     content = open(out).read()
     assert "replan_attempt" not in content
     assert "High correlation detected between" in content
+    assert "n=100" in content
+    assert "p<0.001" in content
+    assert "Correlation does not imply causation." in content
     assert "A replan attempt was triggered after reflection." in content
+
+
+def test_write_markdown_report_surfaces_model_comparison_note(tmp_path):
+    out = str(tmp_path / "report.md")
+    payload = cls_payload()
+    eval_result = evaluate_best(payload, str(tmp_path), is_classification=True)
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_sig",
+        dataset_profile=_cls_profile(),
+        plan=["profile_dataset", "train_models", "evaluate", "validate_with_cross_validation", "reflect"],
+        eval_payload=eval_result,
+        reflection={
+            "status": "ok",
+            "issues": [],
+            "suggestions": [],
+            "replan_recommended": False,
+            "training_warnings": [],
+            "significance_test": {
+                "model_a": "RandomForest",
+                "model_b": "LogisticRegression",
+                "p_value": 0.012,
+                "significant": True,
+                "note": "`RandomForest` is significantly better than `LogisticRegression` across CV folds (paired t-test: p=0.012).",
+            },
+        },
+    )
+    content = open(out).read()
+    assert "### Model Comparison Check" in content
+    assert "significantly better than" in content

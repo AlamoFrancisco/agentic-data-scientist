@@ -4,7 +4,8 @@ Tests for agents/reflector.py
 Covers: reflect (classification + regression paths), should_replan,
 apply_replan_strategy (overfitting, low-F1, baseline, imbalance branches).
 """
-from agents.reflector import reflect, should_replan, apply_replan_strategy
+from agents.planner import apply_replan_strategy
+from agents.reflector import reflect, should_replan
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -101,6 +102,7 @@ def test_classification_near_perfect_multiple_models_flags_suspicion():
         all_m,
     )
     assert result["status"] == "needs_attention"
+    assert result["review_required"] is True
     assert any("suspicious" in i.lower() for i in result["issues"])
     assert any("leakage" in s.lower() or "target prox" in s.lower() for s in result["suggestions"])
 
@@ -141,6 +143,35 @@ def test_regression_weak_baseline_adds_issue():
     ]
     result = reflect(reg_profile(), reg_eval(0.04, model="RF"), all_m)
     assert any("baseline" in i.lower() for i in result["issues"])
+
+
+def test_reflection_marks_profile_leakage_as_needs_attention():
+    profile = {
+        "is_classification": False,
+        "imbalance_ratio": None,
+        "missing_pct": {},
+        "soft_leakage_cols": [{"column": "bmi", "normalised_mi": 1.0, "evidence_level": "soft"}],
+        "leaky_cols": [{"column": "bmi", "normalised_mi": 1.0, "evidence_level": "soft"}],
+    }
+    result = reflect(profile, reg_eval(0.38, model="LinearRegression"), reg_all(0.38))
+    assert result["status"] == "needs_attention"
+    assert result["review_required"] is True
+    assert any("proxy" in issue.lower() or "leakage" in issue.lower() for issue in result["issues"])
+    assert any("human review" in suggestion.lower() for suggestion in result["suggestions"])
+
+
+def test_reflection_marks_hard_leakage_as_review_required():
+    profile = {
+        "is_classification": True,
+        "imbalance_ratio": 1.0,
+        "missing_pct": {},
+        "hard_leakage_cols": [{"column": "alive", "reason": "deterministic_target_mapping"}],
+        "leaky_cols": [{"column": "alive", "reason": "deterministic_target_mapping", "evidence_level": "hard"}],
+    }
+    result = reflect(profile, cls_eval(0.98, 0.98), cls_all(0.98, 0.98))
+    assert result["status"] == "needs_attention"
+    assert result["review_required"] is True
+    assert any("hard target-leakage evidence" in issue.lower() for issue in result["issues"])
 
 
 # ── should_replan ─────────────────────────────────────────────────────────────
@@ -184,13 +215,13 @@ def test_apply_replan_overfitting_adds_regularization():
 def test_apply_replan_low_f1_adds_ensemble():
     reflection = {"issues": ["Macro F1 score is modest (<0.60)."], "suggestions": []}
     new_plan, _ = apply_replan_strategy(BASE_PLAN, {"notes": []}, reflection)
-    assert "try_ensemble_methods" in new_plan
+    assert "use_ensemble_models" in new_plan
 
 
-def test_apply_replan_baseline_issue_adds_feature_engineering():
+def test_apply_replan_baseline_issue_adds_ensemble():
     reflection = {"issues": ["Best model only 0.02 better than baseline."], "suggestions": []}
     new_plan, _ = apply_replan_strategy(BASE_PLAN, {"notes": []}, reflection)
-    assert "apply_feature_engineering" in new_plan
+    assert "use_ensemble_models" in new_plan
 
 
 def test_apply_replan_does_not_modify_original_plan():
@@ -198,3 +229,84 @@ def test_apply_replan_does_not_modify_original_plan():
     reflection = {"issues": ["Macro F1 score is modest (<0.60)."], "suggestions": []}
     apply_replan_strategy(BASE_PLAN, {"notes": []}, reflection)
     assert BASE_PLAN == original
+
+
+def test_apply_replan_imbalance_adds_imbalance_strategy():
+    reflection = {"issues": ["Severe class imbalance detected."], "suggestions": []}
+    new_plan, _ = apply_replan_strategy(BASE_PLAN, {"notes": []}, reflection)
+    assert "consider_imbalance_strategy" in new_plan
+
+
+def test_apply_replan_instability_adds_robust_scaling():
+    reflection = {"issues": ["Numerical instability warnings present alongside weak F1."], "suggestions": []}
+    new_plan, _ = apply_replan_strategy(BASE_PLAN, {"notes": []}, reflection)
+    assert "apply_robust_scaling" in new_plan
+
+
+def test_apply_replan_cv_gap_adds_regularization_and_widens_test():
+    reflection = {
+        "issues": ["Held-out balanced accuracy differs from cross-validation mean."],
+        "suggestions": [],
+    }
+    new_plan, new_profile = apply_replan_strategy(BASE_PLAN, {"notes": []}, reflection)
+    assert "apply_regularization" in new_plan
+    assert new_profile.get("increase_test_size") is True
+
+
+# ── statistical significance testing ─────────────────────────────────────────
+
+def _cv_summary_with_fold_scores(scores_a, scores_b):
+    """Build a minimal cv_summary that includes per-fold scores for two models."""
+    return {
+        "enabled": True,
+        "n_splits": len(scores_a),
+        "models": [
+            {"model": "RandomForest",       "fold_scores": scores_a, "primary_metric_mean": sum(scores_a)/len(scores_a)},
+            {"model": "LogisticRegression", "fold_scores": scores_b, "primary_metric_mean": sum(scores_b)/len(scores_b)},
+        ],
+        "best_model": "RandomForest",
+        "warnings": [],
+    }
+
+
+def test_significance_test_present_when_cv_enabled():
+    cv = _cv_summary_with_fold_scores([0.90, 0.92, 0.91, 0.93, 0.90], [0.60, 0.62, 0.61, 0.63, 0.60])
+    result = reflect(cls_profile(), cls_eval(0.91, 0.85), cls_all(0.91, 0.85), cv_summary=cv)
+    assert result["significance_test"] is not None
+    assert "p_value" in result["significance_test"]
+    assert "significant" in result["significance_test"]
+
+
+def test_significance_test_none_when_cv_disabled():
+    result = reflect(cls_profile(), cls_eval(0.85, 0.80), cls_all(0.85, 0.80))
+    assert result["significance_test"] is None
+
+
+def test_significance_test_significant_for_large_gap():
+    # 0.90 vs 0.50 across 5 folds — gap is clearly real
+    cv = _cv_summary_with_fold_scores([0.90, 0.91, 0.89, 0.92, 0.90], [0.50, 0.51, 0.49, 0.52, 0.50])
+    result = reflect(cls_profile(), cls_eval(0.90, 0.85), cls_all(0.90, 0.85), cv_summary=cv)
+    assert result["significance_test"]["significant"] is True
+
+
+def test_significance_test_not_significant_for_tiny_gap():
+    # Differences alternate direction with near-zero mean — no consistent advantage
+    cv = _cv_summary_with_fold_scores(
+        [0.81, 0.79, 0.82, 0.78, 0.80],
+        [0.80, 0.80, 0.79, 0.81, 0.80],
+    )
+    result = reflect(cls_profile(), cls_eval(0.80, 0.79), cls_all(0.80, 0.79), cv_summary=cv)
+    assert result["significance_test"]["significant"] is False
+    assert any("significant" in s.lower() for s in result["suggestions"])
+
+
+def test_significance_test_none_when_only_one_model():
+    cv = {
+        "enabled": True,
+        "n_splits": 5,
+        "models": [{"model": "RandomForest", "fold_scores": [0.9, 0.9, 0.9, 0.9, 0.9]}],
+        "best_model": "RandomForest",
+        "warnings": [],
+    }
+    result = reflect(cls_profile(), cls_eval(0.90, 0.85), cls_all(0.90, 0.85), cv_summary=cv)
+    assert result["significance_test"] is None

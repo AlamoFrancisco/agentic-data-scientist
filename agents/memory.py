@@ -1,8 +1,35 @@
+"""
+Memory Agent
+
+Persistent JSON-backed store that lets the agent learn from prior runs.
+
+Implemented:
+- Dataset record storage keyed by fingerprint (SHA-256 of shape + column names + target)
+- Multi-strategy lookup: exact fingerprint → dataset filename → target + shape
+- Reliable-record gate: only successful runs (verdict_label == "Reliable result")
+  are reused as planning hints; failed runs are stored as diagnostics only
+- Failed-target tracking: targets that produced no useful result are skipped on
+  subsequent auto-detect runs for the same dataset
+- Cross-dataset similarity matching via size bucket, imbalance flag, and
+  missingness level — used to surface hints for unseen datasets
+
+TODO:
+- Meta-learning from reflection history (track which suggestions led to improvement)
+- Time-decay on stored records (stale results should carry less weight)
+"""
+
 import json
 import os
 import shutil
 from typing import Any, Dict, List, Optional
 from datetime import datetime
+
+from config import (
+    IMBALANCE_THRESHOLD,
+    LARGE_DATASET_ROWS,
+    SEVERE_MISSING_THRESHOLD,
+    SMALL_DATASET_ROWS,
+)
 
 
 def now_iso() -> str:
@@ -38,6 +65,18 @@ class JSONMemory:
     def _is_reliable_record(self, record: Optional[Dict[str, Any]]) -> bool:
         return bool(record) and record.get("verdict_label") == "Reliable result"
 
+    def _matches_target_origins(
+        self,
+        record: Optional[Dict[str, Any]],
+        allowed_target_origins: Optional[List[str]],
+    ) -> bool:
+        if not allowed_target_origins:
+            return True
+        if not record:
+            return False
+        origin = record.get("target_origin") or record.get("target_source")
+        return origin in set(allowed_target_origins)
+
     def get_dataset_record(
         self,
         fingerprint: str,
@@ -45,17 +84,22 @@ class JSONMemory:
         target: Optional[str] = None,
         shape: Optional[Dict] = None,
         require_reliable: bool = False,
+        allowed_target_origins: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         datasets = self.data.get("datasets", {})
         # 1. Exact fingerprint match (same filename)
         if fingerprint in datasets:
             record = datasets[fingerprint]
-            if not require_reliable or self._is_reliable_record(record):
+            if (not require_reliable or self._is_reliable_record(record)) and self._matches_target_origins(record, allowed_target_origins):
                 return record
         # 2. Same dataset name
         if dataset_name:
             for record in datasets.values():
-                if record.get("dataset") == dataset_name and (not require_reliable or self._is_reliable_record(record)):
+                if (
+                    record.get("dataset") == dataset_name
+                    and (not require_reliable or self._is_reliable_record(record))
+                    and self._matches_target_origins(record, allowed_target_origins)
+                ):
                     return record
         # 3. Same target + shape (renamed file)
         if target and shape:
@@ -64,6 +108,7 @@ class JSONMemory:
                     record.get("target") == target
                     and record.get("shape") == shape
                     and (not require_reliable or self._is_reliable_record(record))
+                    and self._matches_target_origins(record, allowed_target_origins)
                 ):
                     return record
         return None
@@ -116,9 +161,9 @@ class JSONMemory:
         return best_match
     
     def size_bucket(self, rows: int) -> str:
-        if rows < 1000:
+        if rows < SMALL_DATASET_ROWS:
             return "small"
-        elif rows < 10000:
+        elif rows < LARGE_DATASET_ROWS:
             return "medium"
         else:
             return "large"
@@ -139,7 +184,7 @@ class JSONMemory:
         # Check 2: both imbalanced? — same imbalance level means similar class distribution
         current_imb = profile.get("imbalance_ratio") or 1.0
         record_imb = record.get("imbalance_ratio") or 1.0
-        if (current_imb >= 3.0) == (record_imb >= 3.0):
+        if (current_imb >= IMBALANCE_THRESHOLD) == (record_imb >= IMBALANCE_THRESHOLD):
             score += 1
         checks += 1
 
@@ -148,7 +193,7 @@ class JSONMemory:
         record_missing = record.get("missing_pct", 0)
         if isinstance(record_missing, dict):
             record_missing = max(record_missing.values(), default=0)
-        if (current_missing > 20) == (record_missing > 20):
+        if (current_missing > SEVERE_MISSING_THRESHOLD) == (record_missing > SEVERE_MISSING_THRESHOLD):
             score += 1
         checks += 1
         
