@@ -35,6 +35,7 @@ from config import (
     LEAKAGE_MI_THRESHOLD,
     HIGH_CORR_THRESHOLD,
     SMALL_DATASET_ROWS,
+    SENSITIVE_COLUMN_KEYWORDS,
 )
 
 NUMERIC_SCHEMA_TYPES = {"ordinal", "continuous"}
@@ -235,6 +236,16 @@ def detect_outliers(df: pd.DataFrame, numeric_cols: List[str], threshold: float 
         if n_out / len(s) > threshold:
             outlier_cols.append(col)
     return outlier_cols
+
+
+def detect_sensitive_columns(df: pd.DataFrame, keywords: set = SENSITIVE_COLUMN_KEYWORDS) -> List[str]:
+    """Flag columns that might contain protected characteristics based on name."""
+    sensitive = []
+    for col in df.columns:
+        lower_col = str(col).lower()
+        if any(kw in lower_col for kw in keywords):
+            sensitive.append(col)
+    return sensitive
 
 
 def correlation_report(
@@ -625,6 +636,12 @@ def profile_dataset(
     elif profile["soft_leakage_cols"]:
         names = [c["column"] for c in profile["soft_leakage_cols"]]
         notes.append(f"Potential target-proxy risk detected in: {names}. Human review recommended.")
+
+    # Ethics & Fairness: Sensitive Attribute Detection
+    sensitive_cols = detect_sensitive_columns(df)
+    profile["sensitive_cols"] = sensitive_cols
+    if sensitive_cols:
+        notes.append(f"Potentially sensitive attributes detected: {sensitive_cols}. Consider algorithmic fairness audits.")
 
     sr = scale_range_report(df, profile["schema"])
     profile["scale_range"] = sr["scale_range"]

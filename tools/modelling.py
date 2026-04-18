@@ -40,6 +40,8 @@ from config import (
     CV_TOP_K,
     TUNE_N_ITER,
     TUNE_CV_SPLITS,
+    TUNE_REDUCED_N_ITER,
+    TUNE_MAX_ROWS,
 )
 
 import warnings
@@ -79,6 +81,13 @@ from sklearn.metrics import (
     recall_score,
 )
 
+# Conditionally import imbalanced-learn so the agent doesn't crash if it's missing
+try:
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    from imblearn.over_sampling import SMOTE
+    HAS_IMBLEARN = True
+except ImportError:
+    HAS_IMBLEARN = False
 
 def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     numeric_groups = profile["feature_types"]["numeric"]
@@ -110,6 +119,13 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     bin_cat_cols = [c for c in bin_cat_cols if c not in leaky_drop]
     multi_cat_cols = [c for c in multi_cat_cols if c not in leaky_drop]
 
+    # Drop sensitive features identified by the planner
+    sensitive_drop = profile.get("sensitive_cols", []) if profile.get("drop_sensitive") else []
+    ord_cols = [c for c in ord_cols if c not in sensitive_drop]
+    cont_cols = [c for c in cont_cols if c not in sensitive_drop]
+    bin_cat_cols = [c for c in bin_cat_cols if c not in sensitive_drop]
+    multi_cat_cols = [c for c in multi_cat_cols if c not in sensitive_drop]
+
     # Drop columns with too many missing values — threshold adapts to dataset size
     rows = profile["shape"]["rows"]
     if rows < SMALL_DATASET_ROWS:
@@ -140,6 +156,7 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     text_cols = profile.get("feature_types", {}).get("text", [])
     text_cols = [c for c in text_cols if c not in leaky_drop and c not in corr_drop and c not in near_const]
     text_cols = [c for c in text_cols if missing_pct.get(c, 0) <= missing_threshold]
+    text_cols = [c for c in text_cols if c not in sensitive_drop]
     high_card_cols += [
         c for c in text_cols
         if MAX_OHE_UNIQUE < n_unique.get(c, 0) < rows * 0.10
@@ -226,7 +243,13 @@ def select_models(
     rows = profile["shape"]["rows"]
     cols = profile["shape"]["cols"]
     imb = float(profile.get("imbalance_ratio") or 1.0)
-    class_weight = "balanced" if imb >= IMBALANCE_THRESHOLD else None
+    # The executor sets use_class_weights when the plan includes
+    # consider_imbalance_strategy. Fall back to the raw profile heuristic for
+    # direct callers that bypass the executor and invoke select_models() alone.
+    use_class_weights = profile.get("use_class_weights")
+    if use_class_weights is None:
+        use_class_weights = imb >= IMBALANCE_THRESHOLD
+    class_weight = "balanced" if use_class_weights else None
     simple_models_only = profile.get("simple_models_only", False)
     
     # Regression models if not a classification task
@@ -256,6 +279,10 @@ def select_models(
         )),
     ]
 
+    # SVC: small datasets only — O(n²–n³) cost, unused probability estimates dropped
+    if rows < SMALL_DATASET_ROWS and cols <= SVC_MAX_COLS:
+        candidates.append(("SVC_RBF", SVC(kernel="rbf", probability=False, class_weight=class_weight)))
+
     # Small datasets: skip complex models to avoid overfitting
     if simple_models_only:
         return prioritize_candidates(candidates, preferred_model)
@@ -265,10 +292,6 @@ def select_models(
     if prefer_ensemble or rows < LARGE_DATASET_ROWS:
         candidates.append(("GradientBoosting", GradientBoostingClassifier(random_state=seed)))
         candidates.append(("HistGradientBoosting", HistGradientBoostingClassifier(random_state=seed)))
-
-    # SVC: small datasets only — O(n²–n³) cost, unused probability estimates dropped
-    if rows < SMALL_DATASET_ROWS and cols <= SVC_MAX_COLS:
-        candidates.append(("SVC_RBF", SVC(kernel="rbf", probability=False, class_weight=class_weight)))
 
     return prioritize_candidates(candidates, preferred_model)
 
@@ -283,6 +306,7 @@ def train_models(
     output_dir: str,
     verbose: bool = True,
     is_classification: bool = True,
+    apply_oversampling: bool = False,
 ) -> Dict[str, Any]:
     if target not in df.columns:
         raise ValueError(f"Target '{target}' not found.")
@@ -308,10 +332,21 @@ def train_models(
         if verbose:
             print(f"[Modelling] Training: {name}")
 
-        pipe = Pipeline(steps=[
-            ("preprocess", preprocessor),
-            ("model", model),
-        ])
+        if apply_oversampling and is_classification:
+            if HAS_IMBLEARN:
+                pipe = ImbPipeline(steps=[
+                    ("preprocess", preprocessor),
+                    ("smote", SMOTE(random_state=seed)),
+                    ("model", model),
+                ])
+            else:
+                warnings.warn("imbalanced-learn is not installed. Skipping SMOTE oversampling.", UserWarning)
+                pipe = Pipeline(steps=[("preprocess", preprocessor), ("model", model)])
+        else:
+            pipe = Pipeline(steps=[
+                ("preprocess", preprocessor),
+                ("model", model),
+            ])
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -566,10 +601,50 @@ def _param_grid(model_name: str) -> Dict[str, List[Any]]:
     return grids.get(model_name, {})
 
 
+def _build_random_search(
+    pipeline: Any,
+    param_grid: Dict[str, List[Any]],
+    scoring: str,
+    cv: Any,
+    seed: int,
+    n_jobs: int,
+    n_iter: int = TUNE_N_ITER,
+) -> RandomizedSearchCV:
+    return RandomizedSearchCV(
+        pipeline,
+        param_distributions=param_grid,
+        n_iter=n_iter,
+        scoring=scoring,
+        cv=cv,
+        random_state=seed,
+        n_jobs=n_jobs,
+        refit=True,
+    )
+
+
+def _is_parallel_backend_error(exc: BaseException) -> bool:
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if isinstance(current, (PermissionError, NotImplementedError)):
+            return True
+        if isinstance(current, OSError) and any(
+            token in message for token in ("operation not permitted", "loky", "joblib", "sc_sem_nsems_max")
+        ):
+            return True
+        if any(token in message for token in ("loky", "joblib", "sc_sem_nsems_max", "operation not permitted")):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def tune_best_model(
     training_payload: Dict[str, Any],
     seed: int = 42,
     is_classification: bool = True,
+    reduce_tuning_budget: bool = False,
 ) -> Dict[str, Any]:
     """
     Tune the best model from training_payload using RandomizedSearchCV.
@@ -606,6 +681,21 @@ def tune_best_model(
     if len(y_train) < TUNE_CV_SPLITS * 2:
         return training_payload
 
+    n_iter = TUNE_REDUCED_N_ITER if reduce_tuning_budget else TUNE_N_ITER
+
+    if reduce_tuning_budget and len(y_train) > TUNE_MAX_ROWS:
+        stratify = y_train if is_classification and y_train.nunique() > 1 and y_train.value_counts().min() >= 2 else None
+        try:
+            X_train_tune, _, y_train_tune, _ = train_test_split(
+                X_train, y_train, train_size=TUNE_MAX_ROWS, random_state=seed, stratify=stratify
+            )
+            X_train, y_train = X_train_tune, y_train_tune
+        except ValueError:
+            X_train_tune, _, y_train_tune, _ = train_test_split(
+                X_train, y_train, train_size=TUNE_MAX_ROWS, random_state=seed
+            )
+            X_train, y_train = X_train_tune, y_train_tune
+
     if is_classification:
         cv = StratifiedKFold(n_splits=TUNE_CV_SPLITS, shuffle=True, random_state=seed)
         scoring = "balanced_accuracy"
@@ -613,20 +703,35 @@ def tune_best_model(
         cv = KFold(n_splits=TUNE_CV_SPLITS, shuffle=True, random_state=seed)
         scoring = "r2"
 
-    search = RandomizedSearchCV(
-        pipeline,
-        param_distributions=param_grid,
-        n_iter=TUNE_N_ITER,
+    search = _build_random_search(
+        pipeline=pipeline,
+        param_grid=param_grid,
         scoring=scoring,
         cv=cv,
-        random_state=seed,
+        seed=seed,
         n_jobs=-1,
-        refit=True,
+        n_iter=n_iter,
     )
 
-    with warnings.catch_warnings(record=True):
-        warnings.simplefilter("always")
-        search.fit(X_train, y_train)
+    try:
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            search.fit(X_train, y_train)
+    except Exception as exc:
+        if not _is_parallel_backend_error(exc):
+            raise
+        search = _build_random_search(
+            pipeline=pipeline,
+            param_grid=param_grid,
+            scoring=scoring,
+            cv=cv,
+            seed=seed,
+            n_jobs=1,
+            n_iter=n_iter,
+        )
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            search.fit(X_train, y_train)
 
     tuned_pipeline = search.best_estimator_
     y_pred = tuned_pipeline.predict(X_test)

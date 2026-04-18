@@ -18,6 +18,13 @@ Sections:
 SMALL_DATASET_ROWS = 1_000    # below this: simpler models, more CV folds, looser missing threshold
 LARGE_DATASET_ROWS = 10_000   # above this: always include ensemble models
 
+# Planner scenario thresholds
+HIGH_DIMENSIONAL_MIN_COLS = 100       # wide datasets benefit from simpler, more regularised plans
+HIGH_DIMENSIONAL_COL_RATIO = 0.25     # also treat p/n-heavy datasets as high-dimensional
+PLANNER_TUNING_MAX_WORKLOAD = 750_000 # rows * cols budget above which tuning is skipped
+PLANNER_CV_MAX_WORKLOAD = 2_000_000   # rows * cols budget above which CV is skipped
+PLANNER_CV_MAX_COLS = 250             # very wide datasets skip CV to control compute
+
 # ── Preprocessing ─────────────────────────────────────────────────────────────
 # Used by: build_preprocessor
 
@@ -94,6 +101,11 @@ R2_LOW_THRESHOLD = 0.10
 TUNE_N_ITER    = 20   # number of random parameter combinations to try
 TUNE_CV_SPLITS = 3    # CV folds used inside RandomizedSearchCV
 
+# ── Cost-Awareness ────────────────────────────────────────────────────────────
+COMPUTE_COST_THRESHOLD = 500_000 # rows * cols above which tuning is scaled down
+TUNE_REDUCED_N_ITER    = 5       # reduced iterations for large datasets
+TUNE_MAX_ROWS          = 10_000  # maximum rows used for tuning if budget is reduced
+
 # ── Profiler thresholds ───────────────────────────────────────────────────────
 # Used by: data_profiler
 
@@ -111,3 +123,10 @@ HIGH_CORR_THRESHOLD = 0.80
 
 # Correlation above which the planner drops the weaker of a correlated pair
 HIGH_CORR_DROP_THRESHOLD = 0.95
+
+# ── Ethics & Fairness ─────────────────────────────────────────────────────────
+# Keywords used to flag potentially sensitive attributes for fairness audits
+SENSITIVE_COLUMN_KEYWORDS = {
+    "age", "gender", "sex", "race", "ethnicity", "religion",
+    "disability", "nationality", "marital_status", "pregnancy"
+}

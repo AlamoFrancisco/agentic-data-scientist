@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 
 import matplotlib
 import numpy as np
+import pandas as pd
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -167,6 +168,7 @@ def _humanize_plan_step(step: str) -> Optional[str]:
         "reflect": "Review the run and diagnose issues.",
         "write_report": "Generate the final report.",
         "consider_imbalance_strategy": "Use an imbalance-aware training strategy.",
+        "apply_oversampling": "Oversample the minority class (e.g., SMOTE) due to severe class imbalance.",
         "apply_regularization": "Bias toward stronger regularization for a smaller dataset.",
         "handle_severe_missing_data": "Use robust preprocessing for higher missingness.",
         "apply_target_encoding": "Use target encoding for high-cardinality categoricals.",
@@ -175,9 +177,11 @@ def _humanize_plan_step(step: str) -> Optional[str]:
         "handle_outliers": "Use outlier-aware preprocessing.",
         "drop_correlated_features": "Drop highly correlated features to reduce redundancy.",
         "drop_leaky_features": "Drop suspected leaky features before training.",
+        "drop_sensitive_features": "Drop sensitive attributes to mitigate direct algorithmic bias.",
         "use_simple_models_only": "Restrict the search to simpler models.",
         "use_ensemble_models": "Favor ensemble models for a larger dataset.",
         "tune_hyperparameters": "Tune the best model's hyperparameters with randomized search.",
+        "reduce_tuning_budget": "Sub-sample data and reduce tuning iterations to stay within compute budget.",
     }
     return mapping.get(step, step.replace("_", " ").capitalize() + ".")
 
@@ -539,7 +543,7 @@ def _cross_validation_section(eval_payload: Dict[str, Any], is_classification: b
     return f"{header}\n{sep}\n{rows}{warning_block}"
 
 
-def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classification: bool = True) -> Dict[str, Any]:
+def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classification: bool = True, dataset_profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     best = training_payload["best"]
     all_metrics = training_payload["all_metrics"]
 
@@ -600,6 +604,32 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classifi
     best_metrics = dict(best["metrics"])
     if per_class_f1:
         best_metrics["per_class_f1"] = per_class_f1
+        
+    # Ethics & Fairness: Calculate Demographic Parity proxy if sensitive cols exist
+    if dataset_profile and is_classification:
+        sensitive_cols = dataset_profile.get("sensitive_cols", [])
+        X_test = best.get("X_test")
+        if sensitive_cols and X_test is not None:
+            fairness = {}
+            for col in sensitive_cols:
+                if col not in X_test.columns:
+                    continue
+                df_fair = pd.DataFrame({"group": X_test[col], "pred": y_pred})
+                top_groups = df_fair["group"].value_counts().nlargest(5).index
+                df_top = df_fair[df_fair["group"].isin(top_groups)]
+                majority_pred = df_fair["pred"].mode()[0]
+                rates = df_top.groupby("group")["pred"].apply(lambda x: (x == majority_pred).mean()).to_dict()
+                if rates:
+                    max_rate = max(rates.values())
+                    min_rate = min(rates.values())
+                    demographic_parity_ratio = min_rate / max_rate if max_rate > 0 else 1.0
+                    fairness[col] = {
+                        "majority_predicted_class": str(majority_pred),
+                        "demographic_parity_ratio": round(float(demographic_parity_ratio), 3),
+                        "selection_rates": {str(k): round(float(v), 3) for k, v in rates.items()}
+                    }
+            if fairness:
+                best_metrics["fairness_metrics"] = fairness
 
     return {
         "best_metrics": best_metrics,
@@ -735,6 +765,18 @@ def write_markdown_report(
         )
     candidates_table = f"{candidates_header}\n{candidates_sep}\n{candidates_rows}"
     cv_section = _cross_validation_section(eval_payload, is_cls)
+    
+    fairness_section = ""
+    fairness_metrics = best.get("fairness_metrics")
+    if fairness_metrics:
+        fairness_section += "## Fairness Audit (Demographic Parity)\n\n"
+        for col, metrics in fairness_metrics.items():
+            fairness_section += f"**Attribute:** `{col}`\n"
+            fairness_section += f"- **Target Class Evaluated:** `{metrics['majority_predicted_class']}`\n"
+            fairness_section += f"- **Demographic Parity Ratio:** `{metrics['demographic_parity_ratio']}` (Ideal ≈ 1.0)\n"
+            fairness_section += "- **Selection Rates by Group:**\n"
+            for group, rate in metrics['selection_rates'].items():
+                fairness_section += f"  - `{group}`: {rate:.1%}\n"
 
     quality_section = "\n".join(f"- {line}" for line in quality_lines)
     profiler_notes_section = (
@@ -771,7 +813,6 @@ def write_markdown_report(
     md = f"""# _Agentic Data Scientist Report_
     
 **Author:** Francisco Antonio Alamo Rios  
-**Registration number:** 2508983
 ---
 
 - **Run ID:** `{ctx.run_id}`
@@ -820,6 +861,7 @@ def write_markdown_report(
 ### Cross-Validation Check
 {cv_section}
 
+{fairness_section}
 ## Reflection
 | Field | Value |
 |---|---|

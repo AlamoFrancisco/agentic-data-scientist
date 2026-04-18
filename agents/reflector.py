@@ -97,7 +97,7 @@ def _compare_models_statistically(
 def _prioritize_suggestions(suggestions: List[str]) -> List[str]:
     """Order suggestions by estimated impact: critical signals first, general advice last."""
     high_priority_keywords = ["instability", "leakage", "scaling", "overflow", "suspicious", "proxy"]
-    medium_priority_keywords = ["regularization", "class weight", "threshold", "ensemble", "feature", "cross-validation"]
+    medium_priority_keywords = ["regularization", "class weight", "threshold", "ensemble", "feature", "cross-validation", "fairness", "sensitive"]
 
     def _priority(s: str) -> int:
         lower = s.lower()
@@ -151,6 +151,7 @@ def reflect(
     review_required = False
     hard_leakage = dataset_profile.get("hard_leakage_cols", [])
     soft_leakage = dataset_profile.get("soft_leakage_cols", [])
+    sensitive_cols = dataset_profile.get("sensitive_cols", [])
 
     if hard_leakage and not dataset_profile.get("drop_leaky"):
         evidence = []
@@ -205,6 +206,13 @@ def reflect(
             "These are soft profiler signals, not proof of leakage."
         )
         review_required = True
+        
+    if sensitive_cols:
+        suggestions.append(
+            f"Sensitive attributes detected (`{', '.join(sensitive_cols)}`). "
+            "Ensure the model does not learn biased representations or create disparate impacts across these groups. "
+            "A formal algorithmic fairness audit is highly recommended."
+        )
 
     def check_cv_consistency(split_metric: float, metric_name: str) -> None:
         nonlocal cv_concerns, review_required
@@ -495,6 +503,3 @@ def should_replan(reflection: Dict[str, Any]) -> bool:
     before setting replan_recommended, so defer entirely to that signal.
     """
     return bool(reflection.get("replan_recommended", False))
-
-
-

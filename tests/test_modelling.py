@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import tools.modelling as modelling
 from tools.modelling import build_preprocessor, cross_validate_top_models, select_models, train_models, tune_best_model
 
 
@@ -172,6 +173,27 @@ def test_select_models_small_dataset_includes_svc():
     profile["shape"]["cols"] = 10
     names = [n for n, _ in select_models(profile)]
     assert "SVC_RBF" in names
+
+
+def test_select_models_respects_use_class_weights_flag():
+    profile = make_profile(make_cls_df())
+    profile["use_class_weights"] = True
+    candidates = dict(select_models(profile))
+
+    assert candidates["LogisticRegression"].class_weight == "balanced"
+    assert candidates["RandomForest"].class_weight == "balanced"
+    assert candidates["SVC_RBF"].class_weight == "balanced"
+
+
+def test_select_models_use_class_weights_flag_can_disable_imbalance_weights():
+    profile = make_profile(make_cls_df())
+    profile["imbalance_ratio"] = 10.0
+    profile["use_class_weights"] = False
+    candidates = dict(select_models(profile))
+
+    assert candidates["LogisticRegression"].class_weight is None
+    assert candidates["RandomForest"].class_weight is None
+    assert candidates["SVC_RBF"].class_weight is None
 
 
 def test_select_models_respects_regression_priority():
@@ -401,6 +423,47 @@ def test_tune_best_model_tuned_flag_set_when_grid_exists():
     if best.get("tuned"):
         assert "best_params" in best
         assert isinstance(best["best_params"], dict)
+
+
+def test_tune_best_model_falls_back_to_single_process_when_parallel_backend_fails(monkeypatch):
+    df = make_cls_df(n=200)
+    trained = _run_training(df, is_classification=True)
+    for r in trained["results"]:
+        if r["name"] == "LogisticRegression":
+            trained["best"] = r
+            break
+
+    seen_n_jobs = []
+
+    class FakeRandomizedSearchCV:
+        def __init__(
+            self,
+            pipeline,
+            param_distributions,
+            n_iter,
+            scoring,
+            cv,
+            random_state,
+            n_jobs,
+            refit,
+        ):
+            self.best_estimator_ = pipeline
+            self.best_params_ = {"model__C": 1.0}
+            self.n_jobs = n_jobs
+            seen_n_jobs.append(n_jobs)
+
+        def fit(self, X, y):
+            if self.n_jobs == -1:
+                raise PermissionError("SC_SEM_NSEMS_MAX operation not permitted")
+            return self
+
+    monkeypatch.setattr(modelling, "RandomizedSearchCV", FakeRandomizedSearchCV)
+
+    tuned = tune_best_model(trained, seed=42, is_classification=True)
+
+    assert seen_n_jobs == [-1, 1]
+    assert tuned["best"]["tuned"] is True
+    assert tuned["best"]["best_params"] == {"model__C": 1.0}
 
 
 def test_tune_best_model_no_grid_returns_unchanged():

@@ -22,6 +22,7 @@ Implemented:
 """
 import os
 import json
+import inspect
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -96,6 +97,10 @@ class AgenticDataScientist:
     def _format_decision_summary(self, plan: List[str], profile: Dict[str, Any]) -> List[str]:
         decisions: List[str] = []
 
+        if "apply_oversampling" in plan:
+            profile["apply_oversampling"] = True
+            decisions.append("oversample minority class (SMOTE)")
+
         if "consider_imbalance_strategy" in plan:
             profile["use_class_weights"] = True
             decisions.append("imbalance-aware class weights")
@@ -140,6 +145,11 @@ class AgenticDataScientist:
                 decisions.append(f"drop leaky features: {leaky_cols}")
             else:
                 decisions.append("drop suspected leaky features")
+                
+        if "drop_sensitive_features" in plan:
+            sensitive_cols = profile.get("sensitive_cols", [])
+            profile["drop_sensitive"] = True
+            decisions.append(f"drop sensitive features: {sensitive_cols}")
 
         if "use_simple_models_only" in plan:
             profile["simple_models_only"] = True
@@ -151,6 +161,10 @@ class AgenticDataScientist:
 
         if "tune_hyperparameters" in plan:
             decisions.append("hyperparameter tuning")
+            
+        if "reduce_tuning_budget" in plan:
+            profile["reduce_tuning_budget"] = True
+            decisions.append("reduce tuning budget (cost-aware)")
 
         preferred_model = self._preferred_model_from_plan(plan)
         if preferred_model:
@@ -389,6 +403,39 @@ class AgenticDataScientist:
                 return model_name or None
         return None
 
+    def _evaluate_best_compat(
+        self,
+        training_payload: Dict[str, Any],
+        profile: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Call evaluate_best while remaining compatible with older test doubles.
+
+        The production evaluate_best accepts dataset_profile, but several smoke
+        tests replace it with lambdas that still use the earlier signature.
+        """
+        kwargs: Dict[str, Any] = {
+            "output_dir": self.ctx.output_dir,
+            "is_classification": profile.get("is_classification", True),
+        }
+
+        try:
+            signature = inspect.signature(evaluate_best)
+        except (TypeError, ValueError):
+            signature = None
+
+        if signature is None:
+            kwargs["dataset_profile"] = profile
+        else:
+            accepts_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+            if accepts_kwargs or "dataset_profile" in signature.parameters:
+                kwargs["dataset_profile"] = profile
+
+        return evaluate_best(training_payload, **kwargs)
+
     def run(
         self,
         data_path: str,
@@ -548,6 +595,7 @@ class AgenticDataScientist:
                             output_dir=self.ctx.output_dir,
                             verbose=self.verbose,
                             is_classification=profile.get("is_classification", True),
+                            apply_oversampling=profile.get("apply_oversampling", False)
                         )
                         break  # Exit retry loop if training succeeded
                     except Exception as e:
@@ -573,6 +621,7 @@ class AgenticDataScientist:
                             results,
                             seed=self.ctx.seed,
                             is_classification=profile.get("is_classification", True),
+                            reduce_tuning_budget=profile.get("reduce_tuning_budget", False),
                         )
                         tuned = results.get("best", {}).get("tuned", False)
                         best_params = results.get("best", {}).get("best_params", {})
@@ -582,7 +631,7 @@ class AgenticDataScientist:
                             self.log("Tuning skipped (no param grid for this model type).")
 
                 # Evaluate the trained models and pick the best one
-                eval_payload = evaluate_best(results, output_dir=self.ctx.output_dir, is_classification=profile.get("is_classification", True))
+                eval_payload = self._evaluate_best_compat(results, profile)
                 if "validate_with_cross_validation" in plan:
                     self.log("Validating top candidate models with cross-validation...")
                     cv_top_k = CV_TOP_K if profile["shape"]["rows"] >= SMALL_DATASET_ROWS else CV_TOP_K_SMALL

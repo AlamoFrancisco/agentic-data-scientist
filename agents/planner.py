@@ -6,6 +6,8 @@ Analyses dataset characteristics and generates a tailored execution plan.
 Implemented:
 - Size-bucket routing: small (<1000) → regularization + simple_models_only;
   large (≥10000) → ensemble models
+- High-dimensional routing: wide / p≈n datasets also bias toward
+  regularization + simple models
 - Scale mismatch detection → apply_robust_scaling
 - Mutual-information leakage detection → drop_leaky_features
 - Near-constant column detection → drop_near_constant_features
@@ -15,10 +17,11 @@ Implemented:
 - Outlier-heavy columns → handle_outliers
 - Severe missing data (>20%) → handle_severe_missing_data
 - Memory-guided model prioritisation → prioritize_model:<name>
+- Cost-aware planning: reduces tuning budget on large workloads and skips
+  cross-validation on extreme workloads
 
 TODO:
-- Plan templates per scenario (high-dimensional, time-series, etc.)
-- Cost-aware planning (estimate compute before committing)
+- Plan templates for unsupported scenarios (datetime-heavy / time-series, etc.)
 - Fallback strategies when initial plan produces no useful result
 """
 
@@ -26,12 +29,40 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from config import (
     HIGH_CORR_DROP_THRESHOLD,
+    HIGH_DIMENSIONAL_COL_RATIO,
+    HIGH_DIMENSIONAL_MIN_COLS,
     IMBALANCE_THRESHOLD,
+    IMBALANCE_VERY_SEVERE,
     LARGE_DATASET_ROWS,
     MAX_OHE_UNIQUE,
+    PLANNER_CV_MAX_COLS,
+    PLANNER_CV_MAX_WORKLOAD,
     SEVERE_MISSING_THRESHOLD,
     SMALL_DATASET_ROWS,
+    COMPUTE_COST_THRESHOLD,
 )
+
+
+def _insert_before_unique(plan: List[str], anchor: str, step: str) -> None:
+    if step not in plan:
+        plan.insert(plan.index(anchor), step)
+
+
+def _append_unique(plan: List[str], step: str) -> None:
+    if step not in plan:
+        plan.append(step)
+
+
+def _feature_count(cols: int) -> int:
+    return max(int(cols) - 1, 1)
+
+
+def _is_high_dimensional(rows: int, cols: int) -> bool:
+    feature_cols = _feature_count(cols)
+    return (
+        feature_cols >= HIGH_DIMENSIONAL_MIN_COLS
+        or (feature_cols / max(int(rows), 1)) >= HIGH_DIMENSIONAL_COL_RATIO
+    )
 
 
 def create_plan(
@@ -40,9 +71,7 @@ def create_plan(
 ) -> List[str]:
     """
     Generate an execution plan based on dataset characteristics.
-    
-    This is a basic implementation. Students should extend this significantly.
-    
+
         Args:
             dataset_profile: Dictionary containing dataset metadata including:
                 - shape: {rows: int, cols: int}
@@ -64,17 +93,9 @@ def create_plan(
         >>> plan = create_plan(profile)
         >>> print(plan)
         ['profile_dataset', 'consider_imbalance_strategy', 'train_models', ...]
-    
-    TODO for students:
-    - Implement conditional logic based on dataset size
-    - Add different strategies for imbalanced datasets
-    - Handle high-cardinality categorical features
-    - Use memory hints to prioritize successful models
-    - Create plan templates for common scenarios
-    - Add preprocessing steps based on data quality
     """
-    
-    # Basic plan structure (students should make this much more sophisticated)
+
+    # Base execution plan; adaptive steps are inserted from profiler signals below.
     plan: List[str] = [
         "profile_dataset",
         "build_preprocessor",
@@ -85,15 +106,13 @@ def create_plan(
         "reflect",
         "write_report",
     ]
-    
-    # TODO: Add sophisticated logic here
-    # Example: Check for imbalance
+
     imb = dataset_profile.get("imbalance_ratio") or 1.0
-    if imb >= IMBALANCE_THRESHOLD:
-        # TODO: Make this more sophisticated
-        # Consider: SMOTE, class weights, threshold tuning, etc.
+    if imb >= IMBALANCE_VERY_SEVERE:
+        plan.insert(plan.index("train_models"), "apply_oversampling")
+    elif imb >= IMBALANCE_THRESHOLD:
         plan.insert(plan.index("train_models"), "consider_imbalance_strategy")
-    
+
     # Size bucket — drives model complexity and regularization
     rows = dataset_profile["shape"]["rows"]
     if rows < SMALL_DATASET_ROWS:
@@ -136,6 +155,12 @@ def create_plan(
     # extra compute is justified; skip for small datasets to stay fast.
     if rows >= SMALL_DATASET_ROWS:
         plan.insert(plan.index("evaluate"), "tune_hyperparameters")
+        
+        # Cost-aware planning: estimate compute cost (rows * cols)
+        complexity = rows * dataset_profile["shape"]["cols"]
+        if complexity > COMPUTE_COST_THRESHOLD:
+            dataset_profile["reduce_tuning_budget"] = True
+            plan.insert(plan.index("tune_hyperparameters"), "reduce_tuning_budget")
 
     # Use robust scaling when scale mismatch detected
     if dataset_profile.get("scale_mismatch"):
@@ -161,6 +186,12 @@ def create_plan(
     if cols_to_drop:
         dataset_profile["corr_cols_to_drop"] = cols_to_drop
         plan.insert(plan.index("build_preprocessor"), "drop_correlated_features")
+        
+    # Drop sensitive features to mitigate direct algorithmic bias
+    sensitive_cols = dataset_profile.get("sensitive_cols", [])
+    if sensitive_cols:
+        dataset_profile["drop_sensitive"] = True
+        plan.insert(plan.index("build_preprocessor"), "drop_sensitive_features")
     
     return plan
 
