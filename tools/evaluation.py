@@ -49,6 +49,34 @@ from config import (
 )
 
 
+_PLAN_STEP_MAPPING = {
+    "profile_dataset": "Profile the dataset and detect risk signals.",
+    "build_preprocessor": "Build the preprocessing pipeline.",
+    "select_models": "Select candidate models.",
+    "train_models": "Train candidate models.",
+    "evaluate": "Evaluate model performance.",
+    "validate_with_cross_validation": "Validate the strongest candidate models with cross-validation.",
+    "reflect": "Review the run and diagnose issues.",
+    "write_report": "Generate the final report.",
+    "consider_imbalance_strategy": "Use an imbalance-aware training strategy.",
+    "apply_oversampling": "Oversample the minority class (e.g., SMOTE) due to severe class imbalance.",
+    "apply_regularization": "Bias toward stronger regularization to reduce overfitting risk.",
+    "handle_severe_missing_data": "Use robust preprocessing for higher missingness.",
+    "apply_target_encoding": "Use target encoding for high-cardinality categoricals.",
+    "apply_feature_engineering": "Add feature engineering before training.",
+    "apply_robust_scaling": "Use robust scaling because feature scales differ substantially.",
+    "handle_outliers": "Use outlier-aware preprocessing.",
+    "drop_correlated_features": "Drop highly correlated features to reduce redundancy.",
+    "drop_leaky_features": "Drop suspected leaky features before training.",
+    "drop_sensitive_features": "Drop sensitive attributes to mitigate direct algorithmic bias.",
+    "use_simple_models_only": "Restrict the search to simpler models.",
+    "use_ensemble_models": "Favor ensemble models for a larger dataset.",
+    "tune_hyperparameters": "Tune the best model's hyperparameters with randomized search.",
+    "reduce_tuning_budget": "Sub-sample data and reduce tuning iterations to stay within compute budget.",
+    "use_time_aware_validation": "Use time-aware cross-validation to prevent future-to-past data leakage.",
+}
+
+
 def save_json(path: str, obj: Any) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
@@ -173,33 +201,7 @@ def _humanize_plan_step(step: str) -> Optional[str]:
         _, _, model_name = step.partition(":")
         return f"Prioritize `{model_name}` based on prior successful runs."
 
-    mapping = {
-        "profile_dataset": "Profile the dataset and detect risk signals.",
-        "build_preprocessor": "Build the preprocessing pipeline.",
-        "select_models": "Select candidate models.",
-        "train_models": "Train candidate models.",
-        "evaluate": "Evaluate model performance.",
-        "validate_with_cross_validation": "Validate the strongest candidate models with cross-validation.",
-        "reflect": "Review the run and diagnose issues.",
-        "write_report": "Generate the final report.",
-        "consider_imbalance_strategy": "Use an imbalance-aware training strategy.",
-        "apply_oversampling": "Oversample the minority class (e.g., SMOTE) due to severe class imbalance.",
-        "apply_regularization": "Bias toward stronger regularization for a smaller dataset.",
-        "handle_severe_missing_data": "Use robust preprocessing for higher missingness.",
-        "apply_target_encoding": "Use target encoding for high-cardinality categoricals.",
-        "apply_feature_engineering": "Add feature engineering before training.",
-        "apply_robust_scaling": "Use robust scaling because feature scales differ substantially.",
-        "handle_outliers": "Use outlier-aware preprocessing.",
-        "drop_correlated_features": "Drop highly correlated features to reduce redundancy.",
-        "drop_leaky_features": "Drop suspected leaky features before training.",
-        "drop_sensitive_features": "Drop sensitive attributes to mitigate direct algorithmic bias.",
-        "use_simple_models_only": "Restrict the search to simpler models.",
-        "use_ensemble_models": "Favor ensemble models for a larger dataset.",
-        "tune_hyperparameters": "Tune the best model's hyperparameters with randomized search.",
-        "reduce_tuning_budget": "Sub-sample data and reduce tuning iterations to stay within compute budget.",
-        "use_time_aware_validation": "Use time-aware cross-validation to prevent future-to-past data leakage.",
-    }
-    return mapping.get(step, step.replace("_", " ").capitalize() + ".")
+    return _PLAN_STEP_MAPPING.get(step, step.replace("_", " ").capitalize() + ".")
 
 
 def _plan_sections(plan: List[str]) -> Dict[str, Any]:
@@ -342,6 +344,35 @@ def _contains_keyword(items: List[str], keywords: List[str]) -> bool:
     return any(keyword in lowered for keyword in keywords)
 
 
+def _split_training_warnings(training_warnings: Optional[List[str]]) -> Dict[str, List[str]]:
+    """
+    Separate warnings that suggest model-risk from environment/dependency noise.
+    """
+    warnings_list = training_warnings or []
+    notice_keywords = (
+        "futurewarning:",
+        "deprecationwarning:",
+        "pyparsingdeprecationwarning:",
+        "could not find the number of physical cores",
+        "__sklearn_tags__",
+        "_validate_data",
+    )
+
+    actionable: List[str] = []
+    notices: List[str] = []
+    for warning in warnings_list:
+        lower = str(warning).lower()
+        if any(keyword in lower for keyword in notice_keywords):
+            notices.append(warning)
+        else:
+            actionable.append(warning)
+
+    return {
+        "actionable": actionable,
+        "notices": notices,
+    }
+
+
 def _cv_alert(eval_payload: Dict[str, Any]) -> Optional[str]:
     cv_payload = eval_payload.get("cross_validation") or {}
     if not cv_payload.get("enabled"):
@@ -379,6 +410,8 @@ def derive_run_verdict(
 ) -> Dict[str, str]:
     best = eval_payload.get("best_metrics", {})
     training_warnings = reflection.get("training_warnings", []) if reflection else []
+    warning_summary = _split_training_warnings(training_warnings)
+    actionable_warnings = warning_summary["actionable"]
     best_model = str(best.get("model", ""))
     hard_leakage = dataset_profile.get("hard_leakage_cols", [])
     soft_leakage = dataset_profile.get("soft_leakage_cols", [])
@@ -443,7 +476,7 @@ def derive_run_verdict(
         or reflection.get("status") == "needs_attention"
         or reflection.get("replan_recommended", False)
         or "Dummy" in best_model
-        or bool(training_warnings)
+        or bool(actionable_warnings)
     ):
         detail = "The run completed, but the reflection step or training process raised signals that warrant follow-up."
         if reflection.get("review_required", False):
@@ -745,6 +778,9 @@ def write_markdown_report(
     reflection_issues = reflection.get("issues", []) if reflection else []
     reflection_suggestions = reflection.get("suggestions", []) if reflection else []
     training_warnings = reflection.get("training_warnings", []) if reflection else []
+    warning_summary = _split_training_warnings(training_warnings)
+    actionable_warnings = warning_summary["actionable"]
+    non_blocking_notices = warning_summary["notices"]
     sig_test = reflection.get("significance_test") if reflection else None
     significance_row = ""
     significance_section = "- No formal model-comparison test was produced."
@@ -832,9 +868,14 @@ def write_markdown_report(
         else "- No follow-up actions were suggested."
     )
     training_warnings_section = (
-        "\n".join(f"- {warning}" for warning in training_warnings)
-        if training_warnings
+        "\n".join(f"- {warning}" for warning in actionable_warnings)
+        if actionable_warnings
         else "- No training warnings were captured."
+    )
+    notices_section = (
+        "\n".join(f"- {warning}" for warning in non_blocking_notices)
+        if non_blocking_notices
+        else "- No dependency or environment notices were captured."
     )
 
     md = f"""# _Agentic Data Scientist Report_
@@ -907,6 +948,9 @@ def write_markdown_report(
 
 ### Training Warnings
 {training_warnings_section}
+
+### Dependency and Environment Notices
+{notices_section}
 
 ## Artefacts
 {f"![Confusion Matrix](confusion_matrix.png)" if eval_payload.get("confusion_matrix_path") else ""}

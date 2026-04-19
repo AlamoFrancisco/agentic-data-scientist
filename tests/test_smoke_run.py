@@ -769,3 +769,176 @@ def test_run_skips_tuning_when_training_is_numerically_unstable(monkeypatch, tmp
     with open(os.path.join(out_dir, "eda_summary.json")) as f:
         profile = json.load(f)
     assert any("numerical-instability" in note.lower() for note in profile.get("notes", []))
+
+
+def test_run_prefers_simpler_model_when_cv_tie_is_not_significant(monkeypatch, tmp_path):
+    data_path = tmp_path / "cv_tie_regression.csv"
+    pd.DataFrame(
+        {
+            "feature": [1.0, 2.0, 3.0, 4.0],
+            "target": [10.0, 20.0, 30.0, 40.0],
+        }
+    ).to_csv(data_path, index=False)
+
+    agent = AgenticDataScientist(
+        memory_path=str(tmp_path / "memory.json"),
+        verbose=False,
+    )
+
+    monkeypatch.setattr(
+        ads,
+        "profile_dataset",
+        lambda df, target, **kwargs: {
+            "shape": {"rows": len(df), "cols": len(df.columns)},
+            "is_classification": False,
+            "notes": [],
+        },
+    )
+    monkeypatch.setattr(
+        ads,
+        "create_plan",
+        lambda profile, memory_hint=None: [
+            "profile_dataset",
+            "build_preprocessor",
+            "select_models",
+            "train_models",
+            "evaluate",
+            "validate_with_cross_validation",
+            "reflect",
+            "write_report",
+        ],
+    )
+    monkeypatch.setattr(ads, "build_preprocessor", lambda profile: object())
+    monkeypatch.setattr(
+        ads,
+        "select_models",
+        lambda profile, seed, preferred_model=None: [
+            ("Ridge", object()),
+            ("LinearRegression", object()),
+        ],
+    )
+    monkeypatch.setattr(
+        ads,
+        "train_models",
+        lambda **kwargs: {
+            "best": {
+                "name": "Ridge",
+                "metrics": {
+                    "model": "Ridge",
+                    "r2": 0.637,
+                    "mae": 0.094,
+                    "rmse": 0.132,
+                },
+            },
+            "results": [
+                {
+                    "name": "Ridge",
+                    "metrics": {
+                        "model": "Ridge",
+                        "r2": 0.637,
+                        "mae": 0.094,
+                        "rmse": 0.132,
+                    },
+                },
+                {
+                    "name": "LinearRegression",
+                    "metrics": {
+                        "model": "LinearRegression",
+                        "r2": 0.636,
+                        "mae": 0.094,
+                        "rmse": 0.132,
+                    },
+                },
+            ],
+            "all_metrics": [
+                {"model": "Ridge", "r2": 0.637, "mae": 0.094, "rmse": 0.132},
+                {"model": "LinearRegression", "r2": 0.636, "mae": 0.094, "rmse": 0.132},
+            ],
+            "training_warnings": [],
+        },
+    )
+    monkeypatch.setattr(
+        ads,
+        "evaluate_best",
+        lambda training_payload, output_dir, is_classification=False: {
+            "best_metrics": dict(training_payload["best"]["metrics"]),
+            "all_metrics": list(training_payload["all_metrics"]),
+        },
+    )
+    monkeypatch.setattr(
+        ads,
+        "cross_validate_top_models",
+        lambda **kwargs: {
+            "enabled": True,
+            "reason": "",
+            "n_splits": 3,
+            "models": [
+                {
+                    "model": "Ridge",
+                    "r2_mean": 0.645,
+                    "r2_std": 0.020,
+                    "fold_scores": [0.620, 0.669, 0.647],
+                },
+                {
+                    "model": "LinearRegression",
+                    "r2_mean": 0.645,
+                    "r2_std": 0.020,
+                    "fold_scores": [0.619, 0.668, 0.647],
+                },
+            ],
+            "best_model": "Ridge",
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(
+        ads,
+        "reflect",
+        lambda **kwargs: {
+            "status": "ok",
+            "best_model": kwargs["evaluation"]["model"],
+            "issues": [],
+            "suggestions": [],
+            "replan_recommended": False,
+            "review_required": False,
+            "training_warnings": [],
+            "significance_test": {
+                "model_a": "Ridge",
+                "model_b": "LinearRegression",
+                "p_value": 0.494,
+                "significant": False,
+                "note": "No significant difference between `Ridge` and `LinearRegression`.",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        ads,
+        "derive_run_verdict",
+        lambda dataset_profile, eval_payload, reflection: {
+            "label": "Reliable result",
+            "detail": "No major issues.",
+        },
+    )
+    monkeypatch.setattr(ads, "should_replan", lambda reflection: False)
+    monkeypatch.setattr(ads, "write_markdown_report", lambda **kwargs: None)
+
+    out_dir = agent.run(
+        data_path=str(data_path),
+        target="target",
+        output_root=str(tmp_path / "outputs"),
+        seed=42,
+        test_size=0.2,
+        max_replans=0,
+    )
+
+    with open(os.path.join(out_dir, "metrics.json")) as f:
+        metrics = json.load(f)
+    with open(os.path.join(out_dir, "reflection.json")) as f:
+        reflection = json.load(f)
+    with open(os.path.join(out_dir, "eda_summary.json")) as f:
+        profile = json.load(f)
+
+    assert metrics["best_metrics"]["model"] == "LinearRegression"
+    assert metrics["all_metrics"][0]["model"] == "LinearRegression"
+    assert metrics["cross_validation"]["best_model"] == "LinearRegression"
+    assert reflection["best_model"] == "LinearRegression"
+    assert any("Selected simpler tied model `LinearRegression`" in note for note in profile.get("notes", []))

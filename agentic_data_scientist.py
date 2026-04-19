@@ -24,11 +24,13 @@ import os
 import json
 import inspect
 import uuid
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import joblib
 
 # Agent components and tooling used by the orchestrator
 from config import (
@@ -46,6 +48,15 @@ from agents.memory import JSONMemory
 from tools.data_profiler import profile_dataset, infer_target_column, dataset_fingerprint, is_classification_target
 from tools.modelling import build_preprocessor, cross_validate_top_models, select_models, train_models, tune_best_model
 from tools.evaluation import evaluate_best, write_markdown_report, save_json, derive_run_verdict
+
+
+class Colors:
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BOLD = '\033[1m'
+    RESET = '\033[0m'
 
 
 # Lightweight container for run metadata and parameters
@@ -92,7 +103,7 @@ class AgenticDataScientist:
     def log(self, msg: str) -> None:
         """Print a log message when verbose is enabled."""
         if self.verbose:
-            print(f"[AgenticDataScientist] {msg}")
+            print(f"{Colors.CYAN}[AgenticDataScientist]{Colors.RESET} {msg}")
 
     def _format_decision_summary(self, plan: List[str], profile: Dict[str, Any]) -> List[str]:
         decisions: List[str] = []
@@ -268,7 +279,6 @@ class AgenticDataScientist:
             )
 
         cv_payload = eval_payload.get("cross_validation") or {}
-        cv_text = "not run"
         if cv_payload.get("enabled"):
             cv_entry = next(
                 (item for item in cv_payload.get("models", []) if item.get("model") == model_name),
@@ -289,13 +299,24 @@ class AgenticDataScientist:
                     )
             else:
                 cv_text = f"{cv_payload.get('n_splits', 0)} folds completed"
+        else:
+            reason = cv_payload.get("reason", "not run")
+            cv_text = f"skipped ({reason})"
+            
+        v_label = verdict["label"]
+        if v_label == "Reliable result":
+            colored_verdict = f"{Colors.GREEN}{Colors.BOLD}{v_label}{Colors.RESET}"
+        elif v_label == "Use with caution":
+            colored_verdict = f"{Colors.YELLOW}{Colors.BOLD}{v_label}{Colors.RESET}"
+        else:
+            colored_verdict = f"{Colors.RED}{Colors.BOLD}{v_label}{Colors.RESET}"
 
         self.log(
-            "Final summary:\n"
-            f"  Best model: {model_name} ({metric_text})\n"
-            f"  Cross-validation: {cv_text}\n"
-            f"  Verdict: {verdict['label']} — {verdict['detail']}\n"
-            f"  Outputs: {self.ctx.output_dir}"
+            f"{Colors.BOLD}Final summary:{Colors.RESET}\n"
+            f"  {Colors.BOLD}Best model:{Colors.RESET} {model_name} ({metric_text})\n"
+            f"  {Colors.BOLD}Cross-validation:{Colors.RESET} {cv_text}\n"
+            f"  {Colors.BOLD}Verdict:{Colors.RESET} {colored_verdict} — {verdict['detail']}\n"
+            f"  {Colors.BOLD}Outputs:{Colors.RESET} {self.ctx.output_dir}"
         )
 
     def _ordered_auto_target_candidates(
@@ -389,6 +410,81 @@ class AgenticDataScientist:
                 f"(R² {best_score:.3f} vs {baseline_score:.3f})"
             )
         return None
+
+    def _model_complexity_rank(self, model_name: str) -> tuple[int, str]:
+        ranks = {
+            "DummyMostFrequent": 0,
+            "DummyMean": 0,
+            "LinearRegression": 1,
+            "LogisticRegression": 1,
+            "Ridge": 2,
+            "SVC_RBF": 3,
+            "RandomForest": 4,
+            "RandomForestRegressor": 4,
+            "GradientBoosting": 5,
+            "GradientBoostingRegressor": 5,
+            "HistGradientBoosting": 6,
+            "HistGradientBoostingRegressor": 6,
+        }
+        return ranks.get(model_name, 50), model_name
+
+    def _preferred_tied_model(self, reflection: Dict[str, Any]) -> Optional[str]:
+        significance = reflection.get("significance_test") or {}
+        if significance.get("significant", True):
+            return None
+
+        model_a = significance.get("model_a")
+        model_b = significance.get("model_b")
+        if not model_a or not model_b:
+            return None
+
+        rank_a = self._model_complexity_rank(str(model_a))
+        rank_b = self._model_complexity_rank(str(model_b))
+        return str(model_a) if rank_a <= rank_b else str(model_b)
+
+    def _promote_model_choice(
+        self,
+        training_payload: Dict[str, Any],
+        cv_payload: Dict[str, Any],
+        model_name: str,
+    ) -> bool:
+        promoted = False
+
+        results_list = training_payload.get("results", [])
+        if results_list:
+            selected_result = next((r for r in results_list if r.get("name") == model_name), None)
+            if selected_result is None:
+                selected_result = next(
+                    (r for r in results_list if r.get("metrics", {}).get("model") == model_name),
+                    None,
+                )
+            if selected_result is not None:
+                training_payload["best"] = selected_result
+                training_payload["results"] = [selected_result] + [
+                    r for r in results_list if r is not selected_result
+                ]
+                promoted = True
+
+        all_metrics = training_payload.get("all_metrics", [])
+        if all_metrics:
+            selected_metrics = next((m for m in all_metrics if m.get("model") == model_name), None)
+            if selected_metrics is not None:
+                training_payload["all_metrics"] = [selected_metrics] + [
+                    m for m in all_metrics if m is not selected_metrics
+                ]
+                promoted = True
+
+        cv_models = cv_payload.get("models", [])
+        if cv_models:
+            selected_cv = next((m for m in cv_models if m.get("model") == model_name), None)
+            if selected_cv is not None:
+                cv_payload["models"] = [selected_cv] + [
+                    m for m in cv_models if m is not selected_cv
+                ]
+                cv_payload["best_model"] = model_name
+                promoted = True
+
+        return promoted
 
     def load_data(self, path: str) -> pd.DataFrame:
         """Load a CSV into a pandas DataFrame and log its shape."""
@@ -626,6 +722,7 @@ class AgenticDataScientist:
                         )
                     else:
                         self.log("Tuning best model hyperparameters...")
+                        tune_start = time.time()
                         results = tune_best_model(
                             results,
                             seed=self.ctx.seed,
@@ -636,7 +733,7 @@ class AgenticDataScientist:
                         tuned = results.get("best", {}).get("tuned", False)
                         best_params = results.get("best", {}).get("best_params", {})
                         if tuned:
-                            self.log(f"Tuning complete. Best params: {best_params}")
+                            self.log(f"Tuning complete (took {time.time() - tune_start:.1f}s). Best params: {best_params}")
                         else:
                             self.log("Tuning skipped (no param grid for this model type).")
 
@@ -644,6 +741,7 @@ class AgenticDataScientist:
                 eval_payload = self._evaluate_best_compat(results, profile)
                 if "validate_with_cross_validation" in plan:
                     self.log("Validating top candidate models with cross-validation...")
+                    cv_start = time.time()
                     cv_top_k = CV_TOP_K if profile["shape"]["rows"] >= SMALL_DATASET_ROWS else CV_TOP_K_SMALL
                     cv_payload = cross_validate_top_models(
                         df=df,
@@ -656,7 +754,7 @@ class AgenticDataScientist:
                     )
                     if cv_payload.get("enabled"):
                         self.log(
-                            f"Cross-validation complete: {cv_payload.get('n_splits', 0)} folds "
+                            f"Cross-validation complete (took {time.time() - cv_start:.1f}s): {cv_payload.get('n_splits', 0)} folds "
                             f"across {len(cv_payload.get('models', []))} model(s)."
                         )
                     else:
@@ -680,6 +778,30 @@ class AgenticDataScientist:
                     cv_summary=cv_payload,
                     plan=plan,
                 )
+                tied_model_choice = self._preferred_tied_model(reflection)
+                current_model = str(eval_payload.get("best_metrics", {}).get("model", ""))
+                if tied_model_choice and tied_model_choice != current_model:
+                    if self._promote_model_choice(results, cv_payload, tied_model_choice):
+                        note = (
+                            f"Selected simpler tied model `{tied_model_choice}` after cross-validation "
+                            "found no significant difference."
+                        )
+                        if note not in profile.setdefault("notes", []):
+                            profile["notes"].append(note)
+                        self.log(
+                            f"Selecting simpler tied model: {tied_model_choice} "
+                            f"(no significant CV difference vs {current_model})."
+                        )
+                        eval_payload = self._evaluate_best_compat(results, profile)
+                        eval_payload["cross_validation"] = cv_payload
+                        reflection = reflect(
+                            dataset_profile=profile,
+                            evaluation=eval_payload["best_metrics"],
+                            all_metrics=eval_payload["all_metrics"],
+                            training_warnings=results.get("training_warnings", []),
+                            cv_summary=cv_payload,
+                            plan=plan,
+                        )
                 verdict = derive_run_verdict(profile, eval_payload, reflection)
 
                 # Persist core run artefacts for later review
@@ -687,6 +809,9 @@ class AgenticDataScientist:
                 save_json(os.path.join(self.ctx.output_dir, "plan.json"), {"plan": plan})
                 save_json(os.path.join(self.ctx.output_dir, "metrics.json"), eval_payload)
                 save_json(os.path.join(self.ctx.output_dir, "reflection.json"), reflection)
+                best_pipeline = results.get("best", {}).get("pipeline")
+                if best_pipeline is not None:
+                    joblib.dump(best_pipeline, os.path.join(self.ctx.output_dir, "best_model_pipeline.joblib"))
 
                 # Generate a human-readable markdown report summarising the run
                 write_markdown_report(
@@ -788,4 +913,5 @@ class AgenticDataScientist:
 
         # Final log and return the directory containing run outputs
         self._log_final_summary(eval_payload, verdict)
+        self.log(f"{Colors.GREEN}{Colors.BOLD}✨ Run complete!{Colors.RESET} Read your full analysis at: {Colors.BOLD}{os.path.join(self.ctx.output_dir, 'report.md')}{Colors.RESET}")
         return self.ctx.output_dir

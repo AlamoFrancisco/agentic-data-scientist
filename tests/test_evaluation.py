@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 
 from tools import evaluation as evaluation_module
-from tools.evaluation import evaluate_best, write_markdown_report
+from tools.evaluation import derive_run_verdict, evaluate_best, write_markdown_report
 
 
 # ── fake context ──────────────────────────────────────────────────────────────
@@ -360,6 +360,61 @@ def test_write_markdown_report_includes_reflection_status_issues_and_warnings(tm
     assert "Needs Attention" in content
     assert "Best model only marginally beats baseline." in content
     assert "RuntimeWarning: overflow encountered in matmul" in content
+
+
+def test_derive_run_verdict_ignores_non_blocking_warning_noise():
+    eval_result = {
+        "best_metrics": {
+            "model": "RandomForest",
+            "accuracy": 0.875,
+            "balanced_accuracy": 0.857,
+            "f1_macro": 0.857,
+        }
+    }
+    verdict = derive_run_verdict(
+        _cls_profile(),
+        eval_result,
+        {
+            "status": "ok",
+            "issues": [],
+            "suggestions": [],
+            "replan_recommended": False,
+            "training_warnings": [
+                "FutureWarning: `BaseEstimator._validate_data` is deprecated in 1.6.",
+                "UserWarning: Could not find the number of physical cores for the following reason:",
+            ],
+        },
+    )
+
+    assert verdict["label"] == "Reliable result"
+
+
+def test_write_markdown_report_separates_non_blocking_notices(tmp_path):
+    out = str(tmp_path / "report.md")
+    payload = cls_payload()
+    eval_result = evaluate_best(payload, str(tmp_path), is_classification=True)
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_notice",
+        dataset_profile=_cls_profile(),
+        plan=["profile_dataset", "apply_regularization", "train_models", "evaluate", "reflect", "write_report"],
+        eval_payload=eval_result,
+        reflection={
+            "status": "ok",
+            "issues": [],
+            "suggestions": [],
+            "replan_recommended": False,
+            "training_warnings": [
+                "RuntimeWarning: overflow encountered in matmul",
+                "FutureWarning: `BaseEstimator._validate_data` is deprecated in 1.6.",
+            ],
+        },
+    )
+    content = open(out).read()
+    assert "Bias toward stronger regularization to reduce overfitting risk." in content
+    assert "### Training Warnings" in content
+    assert "RuntimeWarning: overflow encountered in matmul" in content
+    assert "### Dependency and Environment Notices" in content
+    assert "FutureWarning: `BaseEstimator._validate_data` is deprecated in 1.6." in content
 
 
 def test_write_markdown_report_shows_reliable_result_verdict(tmp_path):
