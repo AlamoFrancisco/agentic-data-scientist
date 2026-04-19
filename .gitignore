@@ -30,9 +30,5 @@ agent_memory.json
 logs/
 *.log
 
-# Claudeagent/
-
-CLAUDE.md
-
 # Data
 data/

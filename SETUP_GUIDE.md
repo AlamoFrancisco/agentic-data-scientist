@@ -173,7 +173,7 @@ Steps to use it safely:
    - Read through all files
    - Run the basic example
    - Trace execution flow
-   - Identify TODOs
+   - Identify extension points
 
 2. **Week 3-4:** Extend Planner and Reflector
    - Start with `agents/planner.py`

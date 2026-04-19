@@ -82,6 +82,15 @@ def save_json(path: str, obj: Any) -> None:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
+def _remove_artifact_if_exists(path: str) -> None:
+    """Delete a stale artefact from a reused output directory."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
 def plot_confusion_matrix(cm: np.ndarray, labels: List[str], out_path: str, title: str) -> None:
     plt.figure()
     plt.imshow(cm, interpolation="nearest")
@@ -122,11 +131,8 @@ def plot_predicted_vs_actual(y_test: Any, y_pred: Any, out_path: str, title: str
     plt.close()
 
 
-def plot_feature_importance(pipeline: Any, out_path: str, title: str, top_n: int = 15) -> Optional[str]:
-    """
-    Horizontal bar chart of the top-N feature importances (or coefficients) from the best model.
-    Returns the saved path, or None if the model does not support feature_importances_.
-    """
+def _feature_importance_data(pipeline: Any) -> Optional[tuple[np.ndarray, List[str]]]:
+    """Return model importance values and aligned feature names when available."""
     try:
         model = pipeline.named_steps["model"]
         if hasattr(model, "feature_importances_"):
@@ -149,6 +155,40 @@ def plot_feature_importance(pipeline: Any, out_path: str, title: str, top_n: int
     except Exception:
         feature_names = [f"f{i}" for i in range(len(importances))]
 
+    return np.asarray(importances), feature_names
+
+
+def top_feature_importance_summary(pipeline: Any, top_n: int = 5) -> List[Dict[str, float]]:
+    """Return the top-N feature drivers sorted from strongest to weakest."""
+    payload = _feature_importance_data(pipeline)
+    if payload is None:
+        return []
+
+    importances, feature_names = payload
+    n = min(top_n, len(importances))
+    if n <= 0:
+        return []
+
+    indices = np.argsort(importances)[-n:][::-1]
+    return [
+        {
+            "feature": str(feature_names[i]),
+            "importance": round(float(importances[i]), 6),
+        }
+        for i in indices
+    ]
+
+
+def plot_feature_importance(pipeline: Any, out_path: str, title: str, top_n: int = 15) -> Optional[str]:
+    """
+    Horizontal bar chart of the top-N feature importances (or coefficients) from the best model.
+    Returns the saved path, or None if the model does not support feature_importances_.
+    """
+    payload = _feature_importance_data(pipeline)
+    if payload is None:
+        return None
+
+    importances, feature_names = payload
     n = min(top_n, len(importances))
     indices = np.argsort(importances)[-n:]
     names = [feature_names[i] for i in indices]
@@ -597,14 +637,19 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classifi
 
     y_test = best["y_test"]
     y_pred = best["y_pred"]
+    cm_out_path = os.path.join(output_dir, "confusion_matrix.png")
+    pcf_out_path = os.path.join(output_dir, "per_class_f1.png")
+    reg_out_path = os.path.join(output_dir, "predicted_vs_actual.png")
+    fi_out_path = os.path.join(output_dir, "feature_importance.png")
 
     per_class_f1: Dict[str, float] = {}
 
     if is_classification:
+        _remove_artifact_if_exists(reg_out_path)
         # Confusion matrix — classification only
         labels = _ordered_class_labels(y_test, y_pred)
         cm = confusion_matrix(y_test, y_pred, labels=labels)
-        cm_path = os.path.join(output_dir, "confusion_matrix.png")
+        cm_path = cm_out_path
         plot_confusion_matrix(cm, [str(label) for label in labels], cm_path, f"Confusion Matrix: {best['name']}")
         cls_report = classification_report(y_test, y_pred, labels=labels, zero_division=0)
         cls_report_dict = classification_report(y_test, y_pred, labels=labels, zero_division=0, output_dict=True)
@@ -615,7 +660,7 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classifi
         # Per-class F1 bar chart
         pcf_path = plot_per_class_f1(
             per_class_f1,
-            os.path.join(output_dir, "per_class_f1.png"),
+            pcf_out_path,
             f"Per-Class F1: {best['name']}",
         )
         # Add per_class_f1 to every model entry so all_metrics has a consistent schema
@@ -629,29 +674,36 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classifi
             }
             enriched_all_metrics.append(m)
     else:
+        _remove_artifact_if_exists(cm_out_path)
+        _remove_artifact_if_exists(pcf_out_path)
         # Regression — predicted vs actual scatter plot
         cm_path = None
         cls_report = None
         pcf_path = None
-        reg_plot_path = os.path.join(output_dir, "predicted_vs_actual.png")
+        reg_plot_path = reg_out_path
         plot_predicted_vs_actual(y_test, y_pred, reg_plot_path, f"Predicted vs Actual: {best['name']}")
         enriched_all_metrics = list(all_metrics)
 
     # Feature importance bar chart — tree-based models only; returns None otherwise
     pipeline = best.get("pipeline")
+    top_features = top_feature_importance_summary(pipeline, top_n=5) if pipeline is not None else []
     fi_path = (
         plot_feature_importance(
             pipeline,
-            os.path.join(output_dir, "feature_importance.png"),
+            fi_out_path,
             f"Feature Importance: {best['name']}",
         )
         if pipeline is not None
         else None
     )
+    if fi_path is None:
+        _remove_artifact_if_exists(fi_out_path)
 
     best_metrics = dict(best["metrics"])
     if per_class_f1:
         best_metrics["per_class_f1"] = per_class_f1
+    if top_features:
+        best_metrics["top_feature_importance"] = top_features
         
     # Ethics & Fairness: Calculate Demographic Parity proxy if sensitive cols exist
     # Note: Fairness auditing is currently scoped to classification. Regression fairness is skipped.
@@ -697,6 +749,7 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classifi
         "classification_report": cls_report,
         "regression_plot_path": reg_plot_path if not is_classification else None,
         "feature_importance_path": fi_path,
+        "top_feature_importance": top_features or None,
         "per_class_f1_path": pcf_path if is_classification else None,
     }
 
@@ -840,6 +893,14 @@ def write_markdown_report(
             for group, rate in metrics['selection_rates'].items():
                 fairness_section += f"  - `{group}`: {rate:.1%}\n"
 
+    top_features = best.get("top_feature_importance") or eval_payload.get("top_feature_importance") or []
+    feature_driver_section = ""
+    if top_features:
+        feature_driver_section += "### Top Feature Drivers\n"
+        feature_driver_section += "The strongest model signals in this run were:\n"
+        for item in top_features:
+            feature_driver_section += f"- `{item['feature']}`: {item['importance']:.3f}\n"
+
     quality_section = "\n".join(f"- {line}" for line in quality_lines)
     profiler_notes_section = (
         "\n".join(f"- {note}" for note in profiler_notes)
@@ -921,6 +982,8 @@ def write_markdown_report(
 
 ## Results (Best Model)
 {metrics_table}
+
+{feature_driver_section}
 
 ### All Candidates
 {candidates_table}

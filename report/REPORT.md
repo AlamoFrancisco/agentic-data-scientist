@@ -298,7 +298,7 @@ This project implements a functioning offline agentic data scientist that adapts
 
 Future work would address the identified limitations, such as implementing progressive leakage threshold reduction during replanning and broadening feature engineering beyond the current low-dimensional quadratic expansion.
 
-The test suite achieves 87% total code coverage (177 tests), well above the 60% requirement, with integration-level smoke tests that exercise the full pipeline end-to-end using real datasets.
+The test suite exceeds the 60% coverage requirement and includes integration-level smoke tests that exercise the full pipeline end-to-end using real datasets.
 
 The most important lesson from this project is that the value of an agentic system lies not in any single technique but in the connections between components. Detecting scale mismatch is only useful if the planner acts on it; leakage detection is only useful if the preprocessor respects it; training warnings are only useful if the reflector surfaces them. Each signal–plan–action–reflection chain required careful wiring across multiple files, and maintaining a shared signal map (`AGENT_SIGNAL_MAP.md`) throughout development proved essential for tracking which signals were implemented end-to-end versus only partially wired.
 

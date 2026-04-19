@@ -44,6 +44,8 @@ Outputs are written to `outputs/[timestamp]/`.
 
 ## Project Structure
 
+Representative structure (abridged for the `data/` directory; see `data/README.md` for the full dataset catalog):
+
 ```
 ce888-agentic-data-scientist/
 │
@@ -66,13 +68,14 @@ ce888-agentic-data-scientist/
 │   └── evaluation.py             # Metrics and reporting
 │
 ├── data/
-│   ├── README.md                 # Dataset documentation and trigger conditions
-│   ├── wine_sklearn.csv          # Small classification (178 rows)
-│   ├── titanic.csv               # Small classification with leakage (891 rows)
-│   ├── digits.csv                # Medium classification, near-constant features (1797 rows)
-│   ├── Sales.csv                 # Large regression with target encoding (30000 rows)
-│   ├── WineQuality.csv           # Medium regression (1700 rows)
-│   └── demo.csv                  # 20-row smoke test dataset
+│   ├── README.md                 # Full dataset catalog and trigger conditions
+│   ├── wine_sklearn.csv          # Small classification example
+│   ├── titanic.csv               # Small classification with leakage
+│   ├── digits.csv                # Medium classification, near-constant features
+│   ├── Sales.csv                 # Large regression with target encoding
+│   ├── WineQuality.csv           # Medium regression baseline
+│   ├── demo.csv                  # 20-row smoke test dataset
+│   └── ...                       # Additional evaluation datasets
 │
 ├── outputs/                       # Generated outputs (gitignored)
 │   └── .gitkeep
@@ -198,12 +201,14 @@ Each run creates `outputs/[timestamp]/`:
 | `metrics.json` | Model performance metrics |
 | `reflection.json` | Issues, suggestions, replan status |
 | `confusion_matrix.png` | Confusion matrix (classification only) |
+| `per_class_f1.png` | Per-class F1 bar chart for the best model (classification only) |
+| `predicted_vs_actual.png` | Predicted-vs-actual scatter plot for the best model (regression only) |
 
 ---
 
 ## Datasets
 
-See [data/README.md](data/README.md) for full documentation of all datasets and the profiler signals each one triggers.
+See [data/README.md](data/README.md) for the full dataset catalog and the profiler signals each one triggers. The table below highlights the primary datasets referenced in the report and usage examples.
 
 | Dataset | Rows | Task | Key triggers |
 |---------|------|------|-------------|
@@ -227,6 +232,10 @@ python3 -m pytest --cov=agents --cov=tools --cov=agentic_data_scientist --cov-re
 
 Current test suite: **194 tests, 0 failing** in local run.
 
+## Presentation Materials
+
+- The final demonstration assets are `slides.pdf` and `demo.mp4`, prepared as part of Deliverable 3.
+
 ---
 
 ## Submission Checklist
@@ -236,7 +245,7 @@ Current test suite: **194 tests, 0 failing** in local run.
 - [x] requirements.txt includes all dependencies (`scikit-learn>=1.3.0`, `imbalanced-learn`)
 - [x] Datasets documented in `data/README.md`
 - [x] Technical report completed — `report/REPORT.md` (~4,000 words)
-- [x] Test coverage > 60% (87% achieved)
+- [x] Test coverage > 60% (local coverage target met)
 - [x] All core components extended significantly
 - [x] At least 3 advanced features implemented
 - [x] Repository is organised for submission

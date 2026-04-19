@@ -9,6 +9,11 @@ import os
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from tools import evaluation as evaluation_module
 from tools.evaluation import derive_run_verdict, evaluate_best, write_markdown_report
@@ -67,6 +72,73 @@ def reg_payload():
     }
 
 
+def cls_payload_with_pipeline():
+    X_train = pd.DataFrame(
+        {
+            "signal": [0, 0, 0, 1, 1, 1, 1, 0],
+            "noise": [0.2, 0.3, 0.1, 0.7, 0.8, 0.9, 0.75, 0.25],
+        }
+    )
+    y_train = pd.Series([0, 0, 0, 1, 1, 1, 1, 0])
+    X_test = pd.DataFrame(
+        {
+            "signal": [0, 1, 0, 1],
+            "noise": [0.15, 0.85, 0.2, 0.8],
+        }
+    )
+    y_test = pd.Series([0, 1, 0, 1])
+
+    preprocess = ColumnTransformer(
+        transformers=[
+            (
+                "cont",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scale", StandardScaler()),
+                    ]
+                ),
+                ["signal", "noise"],
+            )
+        ]
+    )
+    pipeline = Pipeline(
+        steps=[
+            ("preprocess", preprocess),
+            ("model", LogisticRegression(random_state=0, solver="liblinear")),
+        ]
+    )
+    pipeline.fit(X_train, y_train)
+    y_pred = pipeline.predict(X_test)
+
+    best = {
+        "name": "LogisticRegression",
+        "pipeline": pipeline,
+        "metrics": {
+            "model": "LogisticRegression",
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "f1_macro": 1.0,
+            "precision_macro": 1.0,
+            "recall_macro": 1.0,
+        },
+        "y_test": y_test,
+        "y_pred": y_pred,
+    }
+    return {
+        "best": best,
+        "results": [best],
+        "all_metrics": [
+            {
+                "model": "LogisticRegression",
+                "accuracy": 1.0,
+                "balanced_accuracy": 1.0,
+                "f1_macro": 1.0,
+            }
+        ],
+    }
+
+
 # ── evaluate_best ─────────────────────────────────────────────────────────────
 
 def test_evaluate_best_classification_returns_metrics(tmp_path):
@@ -122,6 +194,43 @@ def test_evaluate_best_regression_no_cls_report(tmp_path):
 def test_evaluate_best_regression_returns_metrics(tmp_path):
     result = evaluate_best(reg_payload(), str(tmp_path), is_classification=False)
     assert result["best_metrics"]["model"] == "LinearRegression"
+
+
+def test_evaluate_best_includes_top_feature_importance_summary(tmp_path):
+    result = evaluate_best(cls_payload_with_pipeline(), str(tmp_path), is_classification=True)
+    top_features = result["best_metrics"]["top_feature_importance"]
+
+    assert result["top_feature_importance"] == top_features
+    assert len(top_features) == 2
+    assert {item["feature"] for item in top_features} == {"signal", "noise"}
+    assert top_features[0]["importance"] >= top_features[1]["importance"]
+
+
+def test_evaluate_best_removes_stale_feature_importance_when_unsupported(tmp_path):
+    stale_path = tmp_path / "feature_importance.png"
+    stale_path.write_text("stale", encoding="utf-8")
+
+    result = evaluate_best(cls_payload(), str(tmp_path), is_classification=True)
+
+    assert result["feature_importance_path"] is None
+    assert not stale_path.exists()
+
+
+def test_evaluate_best_removes_irrelevant_artifacts_when_switching_task_type(tmp_path):
+    reg_path = tmp_path / "predicted_vs_actual.png"
+    cm_path = tmp_path / "confusion_matrix.png"
+    pcf_path = tmp_path / "per_class_f1.png"
+
+    reg_path.write_text("stale regression", encoding="utf-8")
+    evaluate_best(cls_payload(), str(tmp_path), is_classification=True)
+    assert not reg_path.exists()
+    assert cm_path.exists()
+    assert pcf_path.exists()
+
+    evaluate_best(reg_payload(), str(tmp_path), is_classification=False)
+    assert not cm_path.exists()
+    assert not pcf_path.exists()
+    assert reg_path.exists()
 
 
 # ── write_markdown_report ─────────────────────────────────────────────────────
@@ -199,6 +308,22 @@ def test_write_markdown_report_classification_contains_accuracy(tmp_path):
     content = open(out).read()
     assert "Accuracy" in content
     assert "RandomForest" in content
+
+
+def test_write_markdown_report_lists_top_feature_drivers(tmp_path):
+    out = str(tmp_path / "report.md")
+    eval_result = evaluate_best(cls_payload_with_pipeline(), str(tmp_path), is_classification=True)
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_feature_drivers",
+        dataset_profile=_cls_profile(),
+        plan=["profile_dataset", "train_models"],
+        eval_payload=eval_result,
+        reflection={"status": "ok", "issues": [], "suggestions": [], "replan_recommended": False, "training_warnings": []},
+    )
+    content = open(out).read()
+    assert "Top Feature Drivers" in content
+    assert "`signal`" in content
+    assert "`noise`" in content
 
 
 def test_write_markdown_report_uses_confidence_aware_summary_language(tmp_path):

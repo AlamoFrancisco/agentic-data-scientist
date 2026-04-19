@@ -19,9 +19,9 @@ Implemented:
 - Memory-guided model prioritisation → prioritize_model:<name>
 - Cost-aware planning: reduces tuning budget on large workloads and skips
   cross-validation on extreme workloads
-
-TODO:
-- Plan templates for unsupported scenarios (datetime-heavy / time-series, etc.)
+- Current scope: general tabular batch workflows; datetime-heavy and full
+  time-series scenarios are handled conservatively rather than through
+  specialised planning templates
 """
 
 from typing import Any, Dict, List, Optional, Tuple
