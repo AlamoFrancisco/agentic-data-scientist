@@ -8,6 +8,7 @@ get_similar_record.
 import json
 import os
 import pytest
+from datetime import datetime, timedelta
 
 from agents.memory import JSONMemory, now_iso
 
@@ -161,6 +162,52 @@ def test_similarity_score_different_bucket_penalised(tmp_path):
     s_same = m._similarity_score(profile, {"shape": {"rows": 700}, "imbalance_ratio": 1.0, "missing_pct": {}})
     s_diff = m._similarity_score(profile, record)
     assert s_diff < s_same
+
+
+def test_similarity_score_time_decay_recent(tmp_path):
+    m = JSONMemory(path=str(tmp_path / "mem.json"))
+    profile = {"shape": {"rows": 500}, "imbalance_ratio": 1.0, "missing_pct": {}}
+    
+    # Recent record (0 days old)
+    recent_ts = datetime.utcnow().isoformat() + "Z"
+    record = {"shape": {"rows": 500}, "imbalance_ratio": 1.0, "missing_pct": {}, "last_seen": recent_ts}
+    
+    score = m._similarity_score(profile, record)
+    assert score == 1.0  # All checks pass, no decay
+
+
+def test_similarity_score_time_decay_half_life(tmp_path):
+    m = JSONMemory(path=str(tmp_path / "mem.json"))
+    profile = {"shape": {"rows": 500}, "imbalance_ratio": 1.0, "missing_pct": {}}
+    
+    # 90 days old
+    old_ts = (datetime.utcnow() - timedelta(days=90)).isoformat() + "Z"
+    record = {"shape": {"rows": 500}, "imbalance_ratio": 1.0, "missing_pct": {}, "last_seen": old_ts}
+    
+    score = m._similarity_score(profile, record)
+    assert 0.49 <= score <= 0.51  # Approx 0.5
+
+
+def test_similarity_score_time_decay_capped(tmp_path):
+    m = JSONMemory(path=str(tmp_path / "mem.json"))
+    profile = {"shape": {"rows": 500}, "imbalance_ratio": 1.0, "missing_pct": {}}
+    
+    # 200 days old (cap is at 0.5)
+    ancient_ts = (datetime.utcnow() - timedelta(days=200)).isoformat() + "Z"
+    record = {"shape": {"rows": 500}, "imbalance_ratio": 1.0, "missing_pct": {}, "last_seen": ancient_ts}
+    
+    score = m._similarity_score(profile, record)
+    assert score == 0.5  # Hard cap at 0.5
+
+
+def test_similarity_score_time_decay_invalid_date(tmp_path):
+    m = JSONMemory(path=str(tmp_path / "mem.json"))
+    profile = {"shape": {"rows": 500}, "imbalance_ratio": 1.0, "missing_pct": {}}
+    
+    record = {"shape": {"rows": 500}, "imbalance_ratio": 1.0, "missing_pct": {}, "last_seen": "not-a-date"}
+    
+    score = m._similarity_score(profile, record)
+    assert score == 1.0  # Fails gracefully, ignores decay
 
 
 # ── get_similar_record ────────────────────────────────────────────────────────

@@ -147,7 +147,7 @@ def create_plan(
     # Text cols that look categorical: more unique values than MAX_OHE_UNIQUE but under 10% of rows
     high_card_text = [
         c for c in text_cols
-        if MAX_OHE_UNIQUE < n_unique.get(c, 0) < rows * 0.10
+        if MAX_OHE_UNIQUE < n_unique.get(c, 0) < rows * MAX_TEXT_UNIQUE_FRAC
     ]
     if high_card_cats or high_card_text:
         _insert_before_unique(plan, "build_preprocessor", "apply_target_encoding")

@@ -13,9 +13,6 @@ Implemented:
 - Cross-dataset similarity matching via size bucket, imbalance flag, and
   missingness level — used to surface hints for unseen datasets
 - Meta-learning from reflection history (stores successful plan adaptations)
-
-TODO:
-- Time-decay on stored records (stale results should carry less weight)
 """
 
 import json
@@ -207,6 +204,21 @@ class JSONMemory:
         checks += 1
         
         # Return average score across all checks, or 0 if no checks were done
-        return score / checks if checks > 0 else 0.0
+        base_score = score / checks if checks > 0 else 0.0
+
+        # Apply time-decay to the score (stale results carry less weight)
+        last_seen_str = record.get("last_seen")
+        if last_seen_str:
+            try:
+                # Strip 'Z' for Python < 3.11 compatibility
+                last_seen_dt = datetime.fromisoformat(last_seen_str.replace("Z", ""))
+                days_old = max(0, (datetime.utcnow() - last_seen_dt).days)
+                # Half-life of 90 days, capped at a minimum weight of 0.5
+                decay_factor = max(0.5, 0.5 ** (days_old / 90.0))
+                base_score *= decay_factor
+            except ValueError:
+                pass
+
+        return base_score
 
    

@@ -107,6 +107,15 @@ def infer_schema(df: pd.DataFrame, cat_max_unique: int = 20) -> Dict[str, str]:
         elif kind == "M":     # datetime
             out[col] = "datetime"
         else:
+            # Attempt to parse object columns as numeric (e.g. TotalCharges with blank spaces)
+            numeric_s = pd.to_numeric(s, errors="coerce")
+            if not numeric_s.isna().all():
+                # If the column is mostly numbers (>80% valid when coerced), it's numeric!
+                valid_ratio = numeric_s.notna().sum() / len(s.dropna())
+                if valid_ratio > 0.80:
+                    out[col] = _infer_numeric_schema_type(numeric_s, max_unique=cat_max_unique)
+                    continue
+
             n_unique = s.dropna().nunique()
             out[col] = "categorical" if n_unique <= cat_max_unique else "text"
     return out
@@ -117,12 +126,13 @@ def _score_target_candidate(
     schema: Dict[str, str],
     nunique: Dict[str, int],
     last_col: str,
+    sensitive_cols: List[str],
 ) -> float:
     """
     Score a column as a target candidate. Higher is better.
     """
     TARGET_NAMES = {
-        "target", "label", "y", "outcome"
+        "target", "label", "y", "outcome", "class"
     }
     score = 0.0
     n = len(df)
@@ -138,17 +148,21 @@ def _score_target_candidate(
     if 2 <= u <= 5:
         score += 1  # bonus for very low cardinality
 
-    # Last column — weak positional signal
+    # Last column — strong positional signal for ML datasets
     if col == last_col:
-        score += 1
+        score += 4
 
     # Penalties
     if n > 0 and (u / n) > 0.5:
-        score -= 3  # ID-like: too many unique values
+        is_float_continuous = schema.get(col) == "continuous" and pd.api.types.is_float_dtype(df[col])
+        if not (is_float_continuous or schema.get(col) == "datetime"):
+            score -= 3  # ID-like penalty applies to highly unique integers and strings
     if schema.get(col) == "text":
         score -= 2
     if schema.get(col) == "all_missing":
         score -= 5
+    if col in sensitive_cols:
+        score -= 10  # Strongly penalize predicting sensitive demographic attributes
 
     return score
 
@@ -162,9 +176,10 @@ def infer_target_column(df: pd.DataFrame, return_scores: bool = False):
     schema = infer_schema(df)
     nunique = {c: int(df[c].nunique(dropna=True)) for c in df.columns}
     last_col = df.columns[-1]
+    sensitive_cols = detect_sensitive_columns(df)
 
     scores = {
-        col: _score_target_candidate(col, df, schema, nunique, last_col)
+        col: _score_target_candidate(col, df, schema, nunique, last_col, sensitive_cols)
         for col in df.columns
     }
 
@@ -226,7 +241,7 @@ def detect_outliers(df: pd.DataFrame, numeric_cols: List[str], threshold: float 
     """
     outlier_cols = []
     for col in numeric_cols:
-        s = df[col].dropna()
+        s = pd.to_numeric(df[col], errors="coerce").dropna()
         if len(s) == 0:
             continue
         q1, q3 = s.quantile(0.25), s.quantile(0.75)
@@ -264,7 +279,8 @@ def correlation_report(
     if len(numeric_cols) < 2:
         return {"corr": None, "high_corr_pairs": []}
 
-    corr = df[numeric_cols].corr(numeric_only=True)
+    numeric_df = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+    corr = numeric_df.corr()
 
     pairs: List[Dict[str, Any]] = []
     for i in range(len(numeric_cols)):
@@ -485,11 +501,10 @@ def leakage_report(
             else:
                 normaliser = target_entropy
         else:
-            y_encoded = y.astype(float).values
-            mi_scores = mutual_info_regression(X, y_encoded, random_state=42)
-            # Normalise by max MI score — keeps threshold scale-invariant for regression
-            max_mi = float(np.max(mi_scores)) if np.max(mi_scores) > 0 else 1.0
-            normaliser = max_mi
+            # Regression MI is unbounded, so a fixed 0.9 threshold flags strong valid
+            # features as leaks. Rely on the Reflector's near-perfect R² check instead.
+            mi_scores = np.zeros(len(feature_cols))
+            normaliser = 1.0
     else:
         mi_scores = np.array([])
         normaliser = 1.0

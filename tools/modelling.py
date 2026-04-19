@@ -215,33 +215,19 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     bin_cat_cols = categorical_groups.get("binary", [])
     multi_cat_cols = categorical_groups.get("multiclass", [])
 
-    # Drop near-constant columns — they carry no signal and hurt one-hot encoding
-    near_const = profile.get("near_constant_cols", [])
-    ord_cols = [c for c in ord_cols if c not in near_const]
-    cont_cols = [c for c in cont_cols if c not in near_const]
-    bin_cat_cols = [c for c in bin_cat_cols if c not in near_const]
-    multi_cat_cols = [c for c in multi_cat_cols if c not in near_const]
+    # Consolidate all dropped columns into a single O(1) lookup set
+    cols_to_drop = set(profile.get("near_constant_cols", []))
+    if profile.get("drop_high_corr"):
+        cols_to_drop.update(profile.get("corr_cols_to_drop", []))
+    if profile.get("drop_leaky"):
+        cols_to_drop.update(profile.get("leaky_col_names", []))
+    if profile.get("drop_sensitive"):
+        cols_to_drop.update(profile.get("sensitive_cols", []))
 
-    # Drop highly correlated features identified by the planner
-    corr_drop = profile.get("corr_cols_to_drop", []) if profile.get("drop_high_corr") else []
-    ord_cols = [c for c in ord_cols if c not in corr_drop]
-    cont_cols = [c for c in cont_cols if c not in corr_drop]
-    bin_cat_cols = [c for c in bin_cat_cols if c not in corr_drop]
-    multi_cat_cols = [c for c in multi_cat_cols if c not in corr_drop]
-
-    # Drop leaky features identified by mutual information analysis
-    leaky_drop = profile.get("leaky_col_names", []) if profile.get("drop_leaky") else []
-    ord_cols = [c for c in ord_cols if c not in leaky_drop]
-    cont_cols = [c for c in cont_cols if c not in leaky_drop]
-    bin_cat_cols = [c for c in bin_cat_cols if c not in leaky_drop]
-    multi_cat_cols = [c for c in multi_cat_cols if c not in leaky_drop]
-
-    # Drop sensitive features identified by the planner
-    sensitive_drop = profile.get("sensitive_cols", []) if profile.get("drop_sensitive") else []
-    ord_cols = [c for c in ord_cols if c not in sensitive_drop]
-    cont_cols = [c for c in cont_cols if c not in sensitive_drop]
-    bin_cat_cols = [c for c in bin_cat_cols if c not in sensitive_drop]
-    multi_cat_cols = [c for c in multi_cat_cols if c not in sensitive_drop]
+    ord_cols = [c for c in ord_cols if c not in cols_to_drop]
+    cont_cols = [c for c in cont_cols if c not in cols_to_drop]
+    bin_cat_cols = [c for c in bin_cat_cols if c not in cols_to_drop]
+    multi_cat_cols = [c for c in multi_cat_cols if c not in cols_to_drop]
 
     # Drop columns with too many missing values — threshold adapts to dataset size
     rows = profile["shape"]["rows"]
@@ -271,9 +257,8 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     # Also include text cols that look categorical (50 < n_unique < 10% of rows)
     # These are classified as "text" by the profiler but are actually high-cardinality categoricals
     text_cols = profile.get("feature_types", {}).get("text", [])
-    text_cols = [c for c in text_cols if c not in leaky_drop and c not in corr_drop and c not in near_const]
+    text_cols = [c for c in text_cols if c not in cols_to_drop]
     text_cols = [c for c in text_cols if missing_pct.get(c, 0) <= missing_threshold]
-    text_cols = [c for c in text_cols if c not in sensitive_drop]
     high_card_cols += [
         c for c in text_cols
         if MAX_OHE_UNIQUE < n_unique.get(c, 0) < rows * MAX_TEXT_UNIQUE_FRAC
@@ -306,16 +291,18 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     continuous_steps = [
         ("coerce_numeric", FunctionTransformer(_coerce_numeric_values, validate=False)),
         ("imputer", continuous_imputer),
+        ("scaler", scaler),
     ]
     if profile.get("use_feature_engineering"):
         continuous_steps.append(("poly", PolynomialFeatures(degree=2, include_bias=False)))
-    continuous_steps.append(("scaler", scaler))
+        continuous_steps.append(("poly_scaler", StandardScaler()))
 
     continuous_transformer = Pipeline(steps=continuous_steps)
 
     ordinal_transformer = Pipeline(steps=[
         ("coerce_numeric", FunctionTransformer(_coerce_numeric_values, validate=False)),
         ("imputer", ordinal_imputer),
+        ("scaler", scaler),
     ])
 
     # Keep one-hot output sparse to avoid densifying wide categorical spaces.
@@ -398,7 +385,7 @@ def select_models(
 
     candidates: List[Tuple[str, Any]] = [
         ("DummyMostFrequent", DummyClassifier(strategy="most_frequent")),
-        ("LogisticRegression", LogisticRegression(C=lr_C, max_iter=2000, class_weight=class_weight, solver="saga", tol=1e-3, random_state=seed)),
+        ("LogisticRegression", LogisticRegression(C=lr_C, max_iter=2000, class_weight=class_weight, solver="lbfgs", random_state=seed)),
         ("RandomForest", RandomForestClassifier(
             n_estimators=N_ESTIMATORS, random_state=seed, n_jobs=-1, class_weight=class_weight
         )),
@@ -436,13 +423,10 @@ def train_models(
     if target not in df.columns:
         raise ValueError(f"Target '{target}' not found.")
 
-    X = df.drop(columns=[target]).copy()
-    y = df[target].copy()
-
     # Drop missing target rows
-    mask = ~y.isna()
-    X = X.loc[mask]
-    y = y.loc[mask]
+    mask = ~df[target].isna()
+    X = df.loc[mask].drop(columns=[target])
+    y = df.loc[mask, target]
 
     # Stratify if possible
     stratify = y if (y.nunique(dropna=True) > 1 and y.value_counts().min() >= 2) else None
@@ -614,12 +598,9 @@ def cross_validate_top_models(
     y = training_payload.get("y_train")
 
     if X is None or y is None:
-        X = df.drop(columns=[target]).copy()
-        y = df[target].copy()
-
-        mask = ~y.isna()
-        X = X.loc[mask]
-        y = y.loc[mask]
+        mask = ~df[target].isna()
+        X = df.loc[mask].drop(columns=[target])
+        y = df.loc[mask, target]
 
     splitter = _cv_splitter(
         y, 
@@ -719,7 +700,7 @@ def _param_grid(model_name: str) -> Dict[str, List[Any]]:
         },
         "LogisticRegression": {
             "model__C": [0.01, 0.1, 1.0, 10.0, 100.0],
-            "model__penalty": ["l1", "l2"],
+            "model__penalty": ["l2"],
         },
         "Ridge": {
             "model__alpha": [0.01, 0.1, 1.0, 10.0, 100.0],

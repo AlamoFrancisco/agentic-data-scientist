@@ -693,6 +693,10 @@ def test_run_skips_tuning_when_training_is_numerically_unstable(monkeypatch, tmp
                     "balanced_accuracy": 0.85,
                     "f1_macro": 0.84,
                 },
+                "warnings": [
+                    "RuntimeWarning: overflow encountered in matmul",
+                    "RuntimeWarning: invalid value encountered in matmul",
+                ],
             },
             "all_metrics": [
                 {

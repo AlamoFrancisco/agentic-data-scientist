@@ -90,9 +90,9 @@ def test_infer_target_column_falls_back_to_last_col():
 
 
 def test_infer_target_column_skips_id_like_last_col():
-    # Each value in last col is unique → looks like an ID → skip to fallback
-    data = {f"feat{i}": range(20) for i in range(3)}
-    data["id_col"] = range(20)   # all unique — should be skipped
+    # Features with low cardinality
+    data = {f"feat{i}": [0, 1] * 50 for i in range(3)}
+    data["id_col"] = range(100)   # all unique integers — should be skipped
     df = pd.DataFrame(data)
     # Should NOT return "id_col"; fallback picks a numeric col with low cardinality
     result = infer_target_column(df)

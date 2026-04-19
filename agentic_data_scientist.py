@@ -373,8 +373,8 @@ class AgenticDataScientist:
             return "best candidate is still the dummy baseline"
 
         warning_keywords = ("overflow", "divide by zero", "invalid value", "singular", "nan")
-        training_warnings = [str(w).lower() for w in training_payload.get("training_warnings", [])]
-        if any(keyword in warning for warning in training_warnings for keyword in warning_keywords):
+        best_warnings = [str(w).lower() for w in best.get("warnings", [])]
+        if any(keyword in warning for warning in best_warnings for keyword in warning_keywords):
             return "initial training already showed numerical-instability warnings"
 
         baseline = next(
@@ -616,6 +616,9 @@ class AgenticDataScientist:
                 target_origin = "inferred"
                 target_type = "classification" if is_classification_target(df[self.ctx.target]) else "regression"
                 self.log(f"Inferred target: {self.ctx.target} (type: {target_type})")
+                if len(auto_target_candidates) > 1:
+                    alts = [f"'{c}'" for c in auto_target_candidates[1:4]]
+                    self.log(f"Alternative targets considered: {', '.join(alts)}")
 
         eval_payload: Dict[str, Any] = {}
         verdict: Dict[str, str] = {}
@@ -777,6 +780,7 @@ class AgenticDataScientist:
                     training_warnings=results.get("training_warnings", []),
                     cv_summary=cv_payload,
                     plan=plan,
+                    memory_hint=prev,
                 )
                 tied_model_choice = self._preferred_tied_model(reflection)
                 current_model = str(eval_payload.get("best_metrics", {}).get("model", ""))
@@ -801,6 +805,7 @@ class AgenticDataScientist:
                             training_warnings=results.get("training_warnings", []),
                             cv_summary=cv_payload,
                             plan=plan,
+                            memory_hint=prev,
                         )
                 verdict = derive_run_verdict(profile, eval_payload, reflection)
 

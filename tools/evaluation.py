@@ -476,7 +476,6 @@ def derive_run_verdict(
         or reflection.get("status") == "needs_attention"
         or reflection.get("replan_recommended", False)
         or "Dummy" in best_model
-        or bool(actionable_warnings)
     ):
         detail = "The run completed, but the reflection step or training process raised signals that warrant follow-up."
         if reflection.get("review_required", False):

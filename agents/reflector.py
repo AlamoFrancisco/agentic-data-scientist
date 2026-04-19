@@ -12,9 +12,7 @@ Implemented:
 - Near-perfect leakage detection: suspicious R²/balanced_accuracy across multiple models
 - Statistical significance testing: paired t-test between best and runner-up CV fold
   scores; flags non-significant gaps so the simpler model can be preferred
-
-TODO: Still to add:
-- Meta-learning from past reflections (read reflection_status from memory)
+- Meta-learning from past reflections (compares current metrics to previous memory records)
 """
 
 from typing import Any, Dict, List, Optional
@@ -143,6 +141,7 @@ def reflect(
     training_warnings: Optional[List[str]] = None,
     cv_summary: Optional[Dict[str, Any]] = None,
     plan: Optional[List[str]] = None,
+    memory_hint: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Analyze results and generate reflection with issues and suggestions.
@@ -153,6 +152,7 @@ def reflect(
         all_metrics: Metrics for all trained models
         training_warnings: Warnings captured during model training
         cv_summary: Cross-validation results, if available
+        memory_hint: Previous run record from memory, if available
 
     Returns:
         Dictionary with:
@@ -334,6 +334,18 @@ def reflect(
                     "consider the simpler model."
                 )
 
+        if memory_hint:
+            prev_status = memory_hint.get("reflection_status", "unknown")
+            prev_metrics = memory_hint.get("best_metrics") or memory_hint.get("diagnostic_metrics") or {}
+            if prev_metrics:
+                prev_r2 = float(prev_metrics.get("r2", 0.0))
+                improvement = r2 - prev_r2
+                if improvement > 0.02:
+                    suggestions.append(f"Meta-learning: The current plan improved R² by {improvement:.3f} compared to the prior run (status: {prev_status}).")
+                elif improvement < -0.02:
+                    issues.append(f"Meta-learning: R² dropped by {abs(improvement):.3f} compared to the prior run.")
+                    suggestions.append("Consider reverting to the strategy used in the previous run if performance does not recover.")
+
         return {
             "status": "needs_attention" if issues else "ok",
             "best_model": best_model,
@@ -489,6 +501,18 @@ def reflect(
                 f"`{significance['model_b']}` (p={significance['p_value']:.3f}) — "
                 "consider the simpler model."
             )
+
+    if memory_hint:
+        prev_status = memory_hint.get("reflection_status", "unknown")
+        prev_metrics = memory_hint.get("best_metrics") or memory_hint.get("diagnostic_metrics") or {}
+        if prev_metrics:
+            prev_bal_acc = float(prev_metrics.get("balanced_accuracy", 0.0))
+            improvement = bal_acc - prev_bal_acc
+            if improvement > 0.02:
+                suggestions.append(f"Meta-learning: The current plan improved balanced accuracy by {improvement:.3f} compared to the prior run (status: {prev_status}).")
+            elif improvement < -0.02:
+                issues.append(f"Meta-learning: Balanced accuracy dropped by {abs(improvement):.3f} compared to the prior run.")
+                suggestions.append("Consider reverting to the strategy used in the previous run if performance does not recover.")
 
     return {
         "status": status,
