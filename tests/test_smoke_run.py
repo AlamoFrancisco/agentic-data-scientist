@@ -20,8 +20,8 @@ def test_smoke_run_creates_outputs(tmp_path):
         verbose=False,
     )
     out_dir = agent.run(
-        data_path=os.path.join(DATA_DIR, "penguins.csv"),
-        target="species",
+        data_path=os.path.join(DATA_DIR, "titanic.csv"),
+        target="survived",
         output_root=str(tmp_path / "outputs"),
         seed=42,
         test_size=0.2,
@@ -39,8 +39,8 @@ def test_smoke_run_metrics_structure(tmp_path):
         verbose=False,
     )
     out_dir = agent.run(
-        data_path=os.path.join(DATA_DIR, "penguins.csv"),
-        target="species",
+        data_path=os.path.join(DATA_DIR, "titanic.csv"),
+        target="survived",
         output_root=str(tmp_path / "outputs"),
         seed=42,
         test_size=0.2,
@@ -62,7 +62,7 @@ def test_smoke_run_auto_target(tmp_path):
         verbose=False,
     )
     out_dir = agent.run(
-        data_path=os.path.join(DATA_DIR, "penguins.csv"),
+        data_path=os.path.join(DATA_DIR, "titanic.csv"),
         target="auto",
         output_root=str(tmp_path / "outputs"),
         seed=42,
@@ -183,10 +183,10 @@ def test_auto_target_ignores_memory_targets_that_were_only_inferred(monkeypatch,
 def test_smoke_run_memory_persists(tmp_path):
     """Second run on same dataset writes a memory record."""
     memory_path = str(tmp_path / "memory.json")
-    data_path = os.path.join(DATA_DIR, "penguins.csv")
+    data_path = os.path.join(DATA_DIR, "titanic.csv")
 
     agent = AgenticDataScientist(memory_path=memory_path, verbose=False)
-    agent.run(data_path=data_path, target="species",
+    agent.run(data_path=data_path, target="survived",
               output_root=str(tmp_path / "run1"), seed=42, max_replans=0)
 
     with open(memory_path) as f:
@@ -220,8 +220,8 @@ def test_smoke_run_verbose_output_uses_compact_summary(tmp_path, capsys):
         verbose=True,
     )
     agent.run(
-        data_path=os.path.join(DATA_DIR, "penguins.csv"),
-        target="species",
+        data_path=os.path.join(DATA_DIR, "titanic.csv"),
+        target="survived",
         output_root=str(tmp_path / "outputs"),
         seed=42,
         test_size=0.2,

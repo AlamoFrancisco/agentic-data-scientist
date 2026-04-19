@@ -31,12 +31,11 @@ source venv/bin/activate       # macOS/Linux
 pip install -r requirements.txt
 
 # Run on a dataset
-python3 run_agent.py --data data/penguins.csv --target species
 python3 run_agent.py --data data/titanic.csv --target survived
 python3 run_agent.py --data data/Sales.csv --target revenue_usd
 
 # Auto-detect target column
-python3 run_agent.py --data data/penguins.csv --target auto
+python3 run_agent.py --data data/titanic.csv --target auto
 ```
 
 Outputs are written to `outputs/[timestamp]/`.

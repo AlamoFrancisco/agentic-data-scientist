@@ -532,7 +532,7 @@ def should_replan(reflection: Dict[str, Any]) -> bool:
 
     Only replan when the reflector explicitly sets replan_recommended=True.
     Using issue count or status alone causes spurious replans on datasets where
-    near-perfect performance or expected warnings exist (e.g. penguins/species).
+    near-perfect performance or expected warnings exist (e.g., highly separable classes).
     The reflect() function already integrates issue severity and f1 thresholds
     before setting replan_recommended, so defer entirely to that signal.
     """
