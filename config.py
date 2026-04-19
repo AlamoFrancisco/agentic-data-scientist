@@ -16,7 +16,7 @@ Sections:
 # Used by: select_models, build_preprocessor, _cv_splitter
 
 SMALL_DATASET_ROWS = 1_000    # below this: simpler models, more CV folds, looser missing threshold
-LARGE_DATASET_ROWS = 10_000   # above this: always include ensemble models
+LARGE_DATASET_ROWS = 10_000   # above this: planner treats the dataset as large and favors scalable ensembles
 
 # Planner scenario thresholds
 HIGH_DIMENSIONAL_MIN_COLS = 100       # wide datasets benefit from simpler, more regularised plans
@@ -53,7 +53,7 @@ FEATURE_IMPORTANCE_THRESHOLD = 0.10
 # ── Model training ────────────────────────────────────────────────────────────
 # Used by: select_models, cross_validate_top_models
 
-N_ESTIMATORS          = 300   # trees in RandomForest / GradientBoosting
+N_ESTIMATORS          = 300   # trees in RandomForest models
 LR_C_DEFAULT          = 1.0   # LogisticRegression regularisation (higher = less regularised)
 LR_C_REGULARISED      = 0.1   # used when apply_regularization is in the plan
 IMBALANCE_THRESHOLD   = 3.0   # imbalance ratio above which class_weight='balanced' is applied

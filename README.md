@@ -149,12 +149,20 @@ Extended profiling signals:
 
 ### 6. Modelling (`tools/modelling.py`)
 - `TargetEncoder` (sklearn ≥ 1.3) for high-cardinality categoricals — fitted inside Pipeline to prevent leakage
+- `OneHotEncoder(drop="if_binary")` for cleaner binary categorical encoding and less redundant linear-model explanations
 - `PolynomialFeatures(degree=2)` for low-dimensional continuous feature engineering
 - `RobustScaler` for outlier handling
 - `SMOTE` oversampling for severe class imbalance (via `imbalanced-learn`)
 - Reduced tuning budget for large workloads
-- Size-bucket model selection (small/medium/large)
+- Size-bucket model selection (small/medium/large), including `SVC_RBF` only for small low-width datasets and HistGradientBoosting preference on very large workloads
 - Runtime warnings captured and surfaced to Reflector
+
+### 7. Evaluation (`tools/evaluation.py`)
+- Native feature explanation for tree ensembles and linear models
+- Permutation-importance fallback for unsupported models such as `SVC_RBF`
+- Feature-name recovery through the preprocessing pipeline, including transformed columns
+- Automatic stale-artefact cleanup so old `feature_importance.png` files do not survive when the final model changes
+- Per-class F1 and fairness-audit reporting in generated outputs
 
 ---
 
@@ -201,6 +209,7 @@ Each run creates `outputs/[timestamp]/`:
 | `metrics.json` | Model performance metrics |
 | `reflection.json` | Issues, suggestions, replan status |
 | `confusion_matrix.png` | Confusion matrix (classification only) |
+| `feature_importance.png` | Feature-importance chart when the final model supports explanation |
 | `per_class_f1.png` | Per-class F1 bar chart for the best model (classification only) |
 | `predicted_vs_actual.png` | Predicted-vs-actual scatter plot for the best model (regression only) |
 
@@ -230,11 +239,11 @@ python3 -m pytest tests/
 python3 -m pytest --cov=agents --cov=tools --cov=agentic_data_scientist --cov-report=term tests/
 ```
 
-Current test suite: **194 tests, 0 failing** in local run.
+Current local suite includes **205 test cases** and is expected to run clean before submission.
 
 ## Presentation Materials
 
-- The final demonstration assets are `slides.pdf` and `demo.mp4`, prepared as part of Deliverable 3.
+- The final Deliverable 3 artefacts are `slides.pdf` and `demo.mp4`.
 
 ---
 

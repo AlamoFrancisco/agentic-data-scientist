@@ -83,17 +83,17 @@ The executor (`agentic_data_scientist.py` main loop) reads plan steps and sets f
 |-----------|------------------|-------------------|--------|
 | `consider_imbalance_strategy` | `use_class_weights = True` | `select_models()` prefers explicit class weights, with `imbalance_ratio` as fallback | Yes |
 | `apply_oversampling` | `apply_oversampling = True` | `train_models()` enables SMOTE when `imbalanced-learn` is installed | Yes |
-| `apply_regularization` | `use_regularization = True` | `LogisticRegression(C=0.1, solver=saga)` | Yes |
+| `apply_regularization` | `use_regularization = True` | `LogisticRegression(C=0.1, solver=lbfgs)` | Yes |
 | `handle_severe_missing_data` | `robust_imputation = True` | Adds indicator-aware numeric imputation and `__missing__` categorical fills | Yes |
-| `apply_target_encoding` | `use_target_encoding = True` | `TargetEncoder` branch added to `ColumnTransformer` for high-cardinality cols (n_unique ≥ 50) | Yes |
+| `apply_target_encoding` | `use_target_encoding = True` | `TargetEncoder` branch added to `ColumnTransformer` for high-cardinality categorical/text-like cols | Yes |
 | `apply_feature_engineering` | `use_feature_engineering = True` | `build_preprocessor()` appends `PolynomialFeatures(degree=2, include_bias=False)` to the continuous pipeline | Yes |
 | `handle_outliers` | `handle_outliers = True` | `RobustScaler` (small) or `RobustScaler(unit_variance=True)` (≥1000 rows) | Yes |
 | `apply_robust_scaling` | `use_robust_scaling = True` | `RobustScaler` instead of `StandardScaler` | Yes |
 | `drop_correlated_features` | `drop_high_corr = True` | Drops `corr_cols_to_drop` in `build_preprocessor()` | Yes |
 | `drop_leaky_features` | `drop_leaky = True` | Drops `leaky_col_names` in `build_preprocessor()` | Yes |
 | `drop_sensitive_features` | `drop_sensitive = True` | Drops `sensitive_cols` in `build_preprocessor()` | Yes |
-| `use_simple_models_only` | `simple_models_only = True` | Only `Dummy + LR + RF` — no GradientBoosting or SVC | Yes |
-| `use_ensemble_models` | `prefer_ensemble = True` | Includes GradientBoosting / HistGradientBoosting in candidate set | Yes |
+| `use_simple_models_only` | `simple_models_only = True` | Restricts to simple candidates; currently `Dummy + LR + RF`, plus `SVC_RBF` when the dataset is small and `cols <= 50` | Yes |
+| `use_ensemble_models` | `prefer_ensemble = True` | Favors tree ensembles; medium datasets can include GradientBoosting + HistGradientBoosting, very large datasets prefer HistGradientBoosting over classic GradientBoosting | Yes |
 | `drop_near_constant_features` | logs columns | Preprocessor already drops `near_constant_cols` unconditionally — step adds plan visibility | Yes |
 | `reduce_tuning_budget` | `reduce_tuning_budget = True` | `tune_best_model()` reduces search iterations and may sub-sample rows | Yes |
 | `tune_hyperparameters` | — | Orchestrator calls `tune_best_model()` on the best candidate | Yes |
@@ -160,9 +160,23 @@ Runtime warnings from sklearn are captured during `train_models()` and stored in
 |---|---|
 | Where stored | `reflection.json` → `training_warnings: [...]` |
 | Scope | Unique warning strings across all trained models per run |
-| Console | Suppressed — won't clutter output |
+| Console | Captured from training/CV; known non-actionable sklearn deprecation noise is filtered during tuning |
 
-> **Current behavior:** Reflector already inspects `training_warnings` and adds a scaling-related suggestion. It escalates them to an issue when weak performance suggests the warnings are actually harming the run.
+> **Current behavior:** Reflector already inspects `training_warnings` and adds a scaling-related suggestion. It escalates them to an issue when weak performance suggests the warnings are actually harming the run. The remaining limitation is that actionable warnings do not automatically downgrade the final verdict if held-out and CV performance still look strong.
+
+### Explanation Outputs
+
+Evaluation now has three explanation paths:
+
+| Signal | Condition | Output / behavior |
+|--------|-----------|-------------------|
+| Native model importances | Best model exposes `feature_importances_` | `feature_importance.png` + `top_feature_importance` using model-native importances |
+| Linear model coefficients | Best model exposes `coef_` | `feature_importance.png` + `top_feature_importance` using absolute coefficients |
+| Unsupported model | No native importances but `X_test`/`y_test` available | Permutation-importance fallback (e.g. `SVC_RBF`) |
+| Preprocessor name export fails | `get_feature_names_out()` unavailable or broken | Best-effort feature-name recovery from the fitted preprocessing graph |
+| Final model changes across passes | Earlier candidate wrote a stale artefact | Old `feature_importance.png` removed if the final model does not support it |
+
+> **Current behavior:** Explanation is now reliable across trees, linear models, and unsupported models via permutation importance, but it is still reported at the transformed feature level rather than always being aggregated back to the original raw feature.
 
 ---
 
@@ -223,11 +237,11 @@ Threshold: ≥ 0.5 (≥ 2 of 3 checks). Returns best match above threshold.
 
 | Bucket | Rows | Models included |
 |--------|------|----------------|
-| Small | < 1000 | Default list can include Dummy + LR + RF + SVC, but planner usually overrides to `simple_models_only=True` |
+| Small | < 1000 | Dummy + LR + RF, and `SVC_RBF` when `cols <= 50` |
 | Medium | 1000–9999 | Dummy + LR + RF + GradientBoosting + HistGradientBoosting |
-| Large | ≥ 10000 | Dummy + LR + RF + GradientBoosting + HistGradientBoosting when `prefer_ensemble=True` |
+| Large | ≥ 10000 | Dummy + LR + RF + HistGradientBoosting when `prefer_ensemble=True` (classic GradientBoosting skipped on very large workloads) |
 
-**SVC:** `probability=False` (Platt scaling removed — unused in pipeline). Only added for small datasets with ≤ 50 raw columns. Currently unreachable because planner always sets `simple_models_only` for rows < 1000.
+**SVC:** `probability=False` (Platt scaling removed — unused in pipeline). Added for small datasets with ≤ 50 raw columns. It remains reachable even under `simple_models_only`, because the candidate list is assembled before the early return.
 
 ---
 
@@ -245,7 +259,9 @@ Threshold: ≥ 0.5 (≥ 2 of 3 checks). Returns best match above threshold.
 | ~~Training warnings not acted on~~ | reflector | Fixed | Overflow/divide warnings now raise suggestion (and issue if performance is also weak) |
 | ~~`apply_oversampling` advertised but not wired~~ | planner/executor/modelling | Fixed | Severe imbalance now routes to SMOTE-compatible training when available |
 | ~~`drop_sensitive_features` advertised but not wired~~ | planner/executor/modelling | Fixed | Sensitive attributes can now be removed before preprocessing |
-| SVC unreachable | modelling | Low | Planner always sets `simple_models_only` for rows < 1000, which returns before SVC is added |
+| Verdict remains optimistic when actionable warnings exist | evaluation/reflector | Medium | Numerical-instability warnings are surfaced, but can still coexist with a `Reliable result` verdict |
+| Explanations still use transformed features | evaluation | Medium | Human-facing reports can still show encoded/expanded feature names instead of raw-feature groups |
+| Proxy fairness remains unresolved | profiler/evaluation | Medium | Dropping sensitive columns does not remove proxy signals such as relationship-based features on `adult.csv` |
 
 ---
 
@@ -255,5 +271,6 @@ Threshold: ≥ 0.5 (≥ 2 of 3 checks). Returns best match above threshold.
 |----------|------|-----|
 | 1 | Tests (>60% coverage required) | Assignment hard requirement — nothing else ships without this |
 | 2 | README / report / signal-map sync | Submission-facing documentation should match the implemented planner and test counts |
-| 3 | Revisit SVC reachability | Small-dataset planning currently makes the SVC branch effectively unreachable |
-| 4 | Expand feature engineering breadth | Current implementation is limited to low-dimensional numeric polynomial expansion |
+| 3 | Downgrade verdicts on actionable warnings | Current warning capture is stronger than the final verdict logic |
+| 4 | Aggregate explanation back to raw features | Current reports are accurate but still overly tied to transformed feature names |
+| 5 | Expand feature engineering breadth | Current implementation is limited to low-dimensional numeric polynomial expansion |
