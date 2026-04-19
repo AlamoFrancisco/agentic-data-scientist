@@ -45,6 +45,7 @@ from config import (
     TUNE_MAX_ROWS,
 )
 
+import time
 import warnings
 import pandas as pd
 import numpy as np
@@ -124,6 +125,34 @@ def _coerce_categorical_values(X: Any) -> Any:
     arr = np.asarray(X, dtype=object).copy()
     arr[pd.isna(arr)] = np.nan
     return arr
+
+
+def _coerce_numeric_values(X: Any) -> Any:
+    """
+    Force coercion to numeric types, turning unparseable strings (like blank spaces) into NaNs.
+    """
+    if isinstance(X, (pd.DataFrame, pd.Series)):
+        return X.apply(pd.to_numeric, errors="coerce")
+    return pd.DataFrame(X).apply(pd.to_numeric, errors="coerce").values
+
+
+def _compute_metrics(model_name: str, y_test: Any, y_pred: Any, is_classification: bool) -> Dict[str, Any]:
+    """Helper to compute standard metrics for evaluation to keep code DRY."""
+    if is_classification:
+        return {
+            "model": model_name,
+            "accuracy": float(accuracy_score(y_test, y_pred)),
+            "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
+            "f1_macro": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
+            "precision_macro": float(precision_score(y_test, y_pred, average="macro", zero_division=0)),
+            "recall_macro": float(recall_score(y_test, y_pred, average="macro", zero_division=0)),
+        }
+    return {
+        "model": model_name,
+        "r2": float(r2_score(y_test, y_pred)),
+        "mae": float(mean_absolute_error(y_test, y_pred)),
+        "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
+    }
 
 
 def _resolve_smote_k_neighbors(y: pd.Series) -> Optional[int]:
@@ -275,6 +304,7 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
         high_card_imputer = SimpleImputer(strategy="most_frequent")
 
     continuous_steps = [
+        ("coerce_numeric", FunctionTransformer(_coerce_numeric_values, validate=False)),
         ("imputer", continuous_imputer),
     ]
     if profile.get("use_feature_engineering"):
@@ -284,6 +314,7 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     continuous_transformer = Pipeline(steps=continuous_steps)
 
     ordinal_transformer = Pipeline(steps=[
+        ("coerce_numeric", FunctionTransformer(_coerce_numeric_values, validate=False)),
         ("imputer", ordinal_imputer),
     ])
 
@@ -425,7 +456,9 @@ def train_models(
 
     for name, model in candidates:
         if verbose:
-            print(f"[Modelling] Training: {name}")
+            print(f"\033[96m[Modelling]\033[0m Training: {name} ... ", end="", flush=True)
+        
+        start_time = time.time()
         pipe = _build_training_pipeline(
             preprocessor=preprocessor,
             model_name=name,
@@ -445,22 +478,13 @@ def train_models(
             f"{w.category.__name__}: {w.message}" for w in caught
         })
 
-        if is_classification:
-            metrics = {
-                "model": name,
-                "accuracy": float(accuracy_score(y_test, y_pred)),
-                "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
-                "f1_macro": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
-                "precision_macro": float(precision_score(y_test, y_pred, average="macro", zero_division=0)),
-                "recall_macro": float(recall_score(y_test, y_pred, average="macro", zero_division=0)),
-            }
-        else:
-            metrics = {
-                "model": name,
-                "r2": float(r2_score(y_test, y_pred)),
-                "mae": float(mean_absolute_error(y_test, y_pred)),
-                "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
-            }
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            metrics = _compute_metrics(name, y_test, y_pred, is_classification)
+
+        elapsed = time.time() - start_time
+        if verbose:
+            print(f"done (took {elapsed:.1f}s)")
 
         results.append({
             "name": name,
@@ -842,22 +866,7 @@ def tune_best_model(
     tuned_pipeline = search.best_estimator_
     y_pred = tuned_pipeline.predict(X_test)
 
-    if is_classification:
-        metrics = {
-            "model": model_name,
-            "accuracy": float(accuracy_score(y_test, y_pred)),
-            "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
-            "f1_macro": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
-            "precision_macro": float(precision_score(y_test, y_pred, average="macro", zero_division=0)),
-            "recall_macro": float(recall_score(y_test, y_pred, average="macro", zero_division=0)),
-        }
-    else:
-        metrics = {
-            "model": model_name,
-            "r2": float(r2_score(y_test, y_pred)),
-            "mae": float(mean_absolute_error(y_test, y_pred)),
-            "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
-        }
+    metrics = _compute_metrics(model_name, y_test, y_pred, is_classification)
 
     tuned_best = {
         **best,
