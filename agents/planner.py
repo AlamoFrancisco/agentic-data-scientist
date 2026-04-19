@@ -189,7 +189,6 @@ def create_plan(
         _insert_before_unique(plan, "evaluate", "tune_hyperparameters")
 
         if complexity > COMPUTE_COST_THRESHOLD:
-            dataset_profile["reduce_tuning_budget"] = True
             _insert_before_unique(plan, "tune_hyperparameters", "reduce_tuning_budget")
 
     # Cross-validation is useful by default, but very wide / extreme workloads
@@ -216,9 +215,12 @@ def create_plan(
 
     # Drop highly correlated features (abs_corr >= 0.95) — likely redundant or leaky
     high_corr_pairs = dataset_profile.get("high_corr_pairs", [])
-    cols_to_drop = list({
-        p["col_b"] for p in high_corr_pairs if p.get("abs_corr", 0) >= HIGH_CORR_DROP_THRESHOLD
-    })
+    target = dataset_profile.get("target")
+    cols_to_drop = []
+    for p in high_corr_pairs:
+        if p.get("abs_corr", 0) >= HIGH_CORR_DROP_THRESHOLD and target not in (p["col_a"], p["col_b"]):
+            cols_to_drop.append(p["col_b"])
+    cols_to_drop = list(set(cols_to_drop))
     if cols_to_drop:
         dataset_profile["corr_cols_to_drop"] = cols_to_drop
         _insert_before_unique(plan, "build_preprocessor", "drop_correlated_features")
@@ -226,7 +228,6 @@ def create_plan(
     # Drop sensitive features to mitigate direct algorithmic bias
     sensitive_cols = dataset_profile.get("sensitive_cols", [])
     if sensitive_cols:
-        dataset_profile["drop_sensitive"] = True
         _insert_before_unique(plan, "build_preprocessor", "drop_sensitive_features")
 
     # Feature engineering: add polynomial features to capture non-linear relationships,
@@ -276,8 +277,8 @@ def apply_replan_strategy(
     if "imbalance" in issues_lower:
         _insert_before_unique(new_plan, "train_models", "consider_imbalance_strategy")
 
-    # Low F1 or weak-vs-baseline: switch to ensemble models for more predictive power
-    if "f1" in issues_lower or "baseline" in issues_lower:
+    # Low F1/R² or weak-vs-baseline: switch to ensemble models for more predictive power
+    if "f1" in issues_lower or "r²" in issues_lower or "r2" in issues_lower or "baseline" in issues_lower:
         _append_unique(new_plan, "use_ensemble_models")
 
     # Numerical instability: apply robust scaling if not already planned

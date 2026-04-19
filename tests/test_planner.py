@@ -189,7 +189,6 @@ def test_cost_aware_planning_reduces_tuning_budget_on_large_workload():
     plan = create_plan(profile)
     assert "tune_hyperparameters" in plan
     assert "reduce_tuning_budget" in plan
-    assert profile["reduce_tuning_budget"] is True
 
 
 def test_extreme_workload_skips_cross_validation():
