@@ -5,9 +5,11 @@ Covers: infer_schema, infer_target_column, is_classification_target,
 dataset_fingerprint, profile_dataset (classification + regression paths,
 imbalance detection, small/high-dim notes, missing target error).
 """
+import warnings
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.stats import ConstantInputWarning
 
 from tools.data_profiler import (
     correlation_report,
@@ -178,6 +180,31 @@ def test_correlation_report_detects_high_correlation_pairs():
     )
     assert ab_pair["n"] == 30
     assert ab_pair["p_value"] == 0.0
+
+
+def test_correlation_report_skips_constant_pairs_without_warning():
+    df = pd.DataFrame(
+        {
+            "constant_col": [1] * 20,
+            "varying_a": np.arange(20),
+            "varying_b": np.arange(20) * 3,
+        }
+    )
+    schema = infer_schema(df)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = correlation_report(df, schema)
+
+    assert not any(issubclass(w.category, ConstantInputWarning) for w in caught)
+    assert all(
+        "constant_col" not in {pair["col_a"], pair["col_b"]}
+        for pair in result["high_corr_pairs"]
+    )
+    assert any(
+        {pair["col_a"], pair["col_b"]} == {"varying_a", "varying_b"}
+        for pair in result["high_corr_pairs"]
+    )
 
 
 # ── profile_dataset ───────────────────────────────────────────────────────────

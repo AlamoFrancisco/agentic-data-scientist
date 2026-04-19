@@ -33,6 +33,7 @@ from config import (
     NEAR_CONSTANT_THRESHOLD,
     OUTLIER_FRACTION_THRESHOLD,
     LEAKAGE_MI_THRESHOLD,
+    SCALE_MISMATCH_THRESHOLD,
     HIGH_CORR_THRESHOLD,
     SMALL_DATASET_ROWS,
     SENSITIVE_COLUMN_KEYWORDS,
@@ -271,11 +272,17 @@ def correlation_report(
             a = numeric_cols[i]
             b = numeric_cols[j]
             v = float(corr.loc[a, b])
+            if not np.isfinite(v):
+                continue
             av = abs(v)
 
             valid = df[[a, b]].dropna()
             pair_n = int(len(valid))
-            if pair_n >= 3:
+            if (
+                pair_n >= 3
+                and valid[a].nunique(dropna=True) > 1
+                and valid[b].nunique(dropna=True) > 1
+            ):
                 try:
                     _, p_value = pearsonr(valid[a], valid[b])
                     p_value = float(p_value)
@@ -538,7 +545,7 @@ def scale_range_report(df: pd.DataFrame, schema: Dict[str, str]) -> Dict[str, An
         med_r = float(np.median(range_values))
         ratio = max_r / med_r if med_r else float("inf")
         scale_range_ratio = round(ratio, 2)
-        scale_mismatch = ratio >= 50
+        scale_mismatch = ratio >= SCALE_MISMATCH_THRESHOLD
 
     return {
         "scale_range": ranges,

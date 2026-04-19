@@ -6,7 +6,7 @@ Preprocessing pipeline construction, model selection, training, and cross-valida
 Implemented:
 - build_preprocessor: ColumnTransformer with adaptive imputation, StandardScaler /
   RobustScaler (outlier or scale-mismatch flag), OneHotEncoder for low-cardinality
-  categoricals, TargetEncoder (sklearn ≥1.3) for high-cardinality columns; drops
+  categorical, TargetEncoder (sklearn ≥1.3) for high-cardinality columns; drops
   near-constant, correlated, and leaky features before fitting
 - select_models: size-bucket selection (small / medium / large); class_weight='balanced'
   for imbalanced datasets; SVC only for small datasets (rows <1000, cols ≤50) to avoid
@@ -29,6 +29,7 @@ from config import (
     MISSING_THRESHOLD_LARGE,
     MAX_OHE_UNIQUE,
     MAX_OHE_UNIQUE_FRAC,
+    MAX_TEXT_UNIQUE_FRAC,
     OUTLIER_CLIP_MIN_ROWS,
     SVC_MAX_COLS,
     N_ESTIMATORS,
@@ -47,15 +48,24 @@ from config import (
 import warnings
 import pandas as pd
 import numpy as np
+from scipy import sparse
 
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler, RobustScaler, TargetEncoder, PolynomialFeatures
+from sklearn.preprocessing import (
+    FunctionTransformer,
+    OneHotEncoder,
+    StandardScaler,
+    RobustScaler,
+    TargetEncoder,
+    PolynomialFeatures,
+)
 from sklearn.model_selection import (
     KFold,
     StratifiedKFold,
     RandomizedSearchCV,
+    TimeSeriesSplit,
     cross_validate,
     train_test_split,
 )
@@ -88,6 +98,84 @@ try:
     HAS_IMBLEARN = True
 except ImportError:
     HAS_IMBLEARN = False
+
+
+_DENSE_MODEL_NAMES = {
+    "GradientBoosting",
+    "GradientBoostingRegressor",
+    "HistGradientBoosting",
+    "HistGradientBoostingRegressor",
+}
+
+
+def _to_dense_if_sparse(X: Any) -> Any:
+    return X.toarray() if sparse.issparse(X) else X
+
+
+def _coerce_categorical_values(X: Any) -> Any:
+    """
+    Route semantic categoricals through an object-typed container so string
+    imputers work even when the raw data is integer-coded (for example 0/1).
+    """
+    if isinstance(X, (pd.DataFrame, pd.Series)):
+        casted = X.astype("object")
+        return casted.where(pd.notna(casted), np.nan)
+
+    arr = np.asarray(X, dtype=object).copy()
+    arr[pd.isna(arr)] = np.nan
+    return arr
+
+
+def _resolve_smote_k_neighbors(y: pd.Series) -> Optional[int]:
+    """
+    SMOTE needs at least k_neighbors + 1 samples in the smallest class.
+    Adapt k to the actual training split so rare classes do not crash fitting.
+    """
+    class_counts = y.value_counts(dropna=False)
+    if class_counts.empty:
+        return None
+
+    min_class_count = int(class_counts.min())
+    if min_class_count < 2:
+        return None
+
+    return min(5, min_class_count - 1)
+
+
+def _build_training_pipeline(
+    *,
+    preprocessor: ColumnTransformer,
+    model_name: str,
+    model: Any,
+    seed: int,
+    apply_oversampling: bool,
+    is_classification: bool,
+    smote_k_neighbors: Optional[int] = None,
+) -> Any:
+    steps: List[Tuple[str, Any]] = [("preprocess", preprocessor)]
+    needs_dense = model_name in _DENSE_MODEL_NAMES or (apply_oversampling and is_classification)
+
+    if needs_dense:
+        steps.append(("to_dense", FunctionTransformer(_to_dense_if_sparse, accept_sparse=True)))
+
+    if apply_oversampling and is_classification:
+        if HAS_IMBLEARN and smote_k_neighbors is not None:
+            steps.extend([
+                ("smote", SMOTE(random_state=seed, k_neighbors=smote_k_neighbors)),
+                ("model", model),
+            ])
+            return ImbPipeline(steps=steps)
+
+        if HAS_IMBLEARN:
+            warnings.warn(
+                "Skipping SMOTE oversampling because the smallest training class has fewer than 2 samples.",
+                UserWarning,
+            )
+        else:
+            warnings.warn("imbalanced-learn is not installed. Skipping SMOTE oversampling.", UserWarning)
+
+    steps.append(("model", model))
+    return Pipeline(steps=steps)
 
 def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     numeric_groups = profile["feature_types"]["numeric"]
@@ -159,7 +247,7 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     text_cols = [c for c in text_cols if c not in sensitive_drop]
     high_card_cols += [
         c for c in text_cols
-        if MAX_OHE_UNIQUE < n_unique.get(c, 0) < rows * 0.10
+        if MAX_OHE_UNIQUE < n_unique.get(c, 0) < rows * MAX_TEXT_UNIQUE_FRAC
     ]
     
     use_robust_scaling = profile.get("use_robust_scaling", False)
@@ -207,6 +295,7 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
         ohe = OneHotEncoder(handle_unknown="ignore", sparse=True)
 
     categorical_transformer = Pipeline(steps=[
+        ("coerce_categorical", FunctionTransformer(_coerce_categorical_values, validate=False)),
         ("imputer", categorical_imputer),
         ("onehot", ohe),
     ])
@@ -220,6 +309,7 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     # Target encoding for high-cardinality categoricals (only when flag is set)
     if profile.get("use_target_encoding") and high_card_cols:
         target_enc_transformer = Pipeline(steps=[
+            ("coerce_categorical", FunctionTransformer(_coerce_categorical_values, validate=False)),
             ("imputer", high_card_imputer),
             ("target_enc", TargetEncoder()),
         ])
@@ -329,28 +419,22 @@ def train_models(
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=seed, stratify=stratify
     )
+    smote_k_neighbors = _resolve_smote_k_neighbors(y_train) if (apply_oversampling and is_classification) else None
 
     results: List[Dict[str, Any]] = []
 
     for name, model in candidates:
         if verbose:
             print(f"[Modelling] Training: {name}")
-
-        if apply_oversampling and is_classification:
-            if HAS_IMBLEARN:
-                pipe = ImbPipeline(steps=[
-                    ("preprocess", preprocessor),
-                    ("smote", SMOTE(random_state=seed)),
-                    ("model", model),
-                ])
-            else:
-                warnings.warn("imbalanced-learn is not installed. Skipping SMOTE oversampling.", UserWarning)
-                pipe = Pipeline(steps=[("preprocess", preprocessor), ("model", model)])
-        else:
-            pipe = Pipeline(steps=[
-                ("preprocess", preprocessor),
-                ("model", model),
-            ])
+        pipe = _build_training_pipeline(
+            preprocessor=preprocessor,
+            model_name=name,
+            model=model,
+            seed=seed,
+            apply_oversampling=apply_oversampling,
+            is_classification=is_classification,
+            smote_k_neighbors=smote_k_neighbors,
+        )
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -413,11 +497,18 @@ def _cv_splitter(
     seed: int,
     rows: int,
     is_classification: bool,
+    time_aware: bool = False,
 ):
     if rows < 4:
         return None
 
     desired_splits = CV_SPLITS_SMALL if rows < SMALL_DATASET_ROWS else CV_SPLITS_DEFAULT
+
+    if time_aware:
+        n_splits = min(desired_splits, rows)
+        if n_splits < 2:
+            return None
+        return TimeSeriesSplit(n_splits=n_splits)
 
     if is_classification:
         min_class_count = int(y.value_counts(dropna=False).min())
@@ -490,6 +581,7 @@ def cross_validate_top_models(
     seed: int,
     is_classification: bool = True,
     top_k: int = CV_TOP_K,
+    time_aware: bool = False,
 ) -> Dict[str, Any]:
     if target not in df.columns:
         raise ValueError(f"Target '{target}' not found.")
@@ -505,7 +597,13 @@ def cross_validate_top_models(
         X = X.loc[mask]
         y = y.loc[mask]
 
-    splitter = _cv_splitter(y, seed=seed, rows=len(X), is_classification=is_classification)
+    splitter = _cv_splitter(
+        y, 
+        seed=seed, 
+        rows=len(X), 
+        is_classification=is_classification, 
+        time_aware=time_aware
+    )
     if splitter is None:
         return {
             "enabled": False,
@@ -650,6 +748,7 @@ def tune_best_model(
     seed: int = 42,
     is_classification: bool = True,
     reduce_tuning_budget: bool = False,
+    time_aware: bool = False,
 ) -> Dict[str, Any]:
     """
     Tune the best model from training_payload using RandomizedSearchCV.
@@ -701,7 +800,9 @@ def tune_best_model(
             )
             X_train, y_train = X_train_tune, y_train_tune
 
-    if is_classification:
+    if time_aware:
+        cv = TimeSeriesSplit(n_splits=TUNE_CV_SPLITS)
+    elif is_classification:
         cv = StratifiedKFold(n_splits=TUNE_CV_SPLITS, shuffle=True, random_state=seed)
         scoring = "balanced_accuracy"
     else:

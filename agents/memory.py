@@ -12,9 +12,9 @@ Implemented:
   subsequent auto-detect runs for the same dataset
 - Cross-dataset similarity matching via size bucket, imbalance flag, and
   missingness level — used to surface hints for unseen datasets
+- Meta-learning from reflection history (stores successful plan adaptations)
 
 TODO:
-- Meta-learning from reflection history (track which suggestions led to improvement)
 - Time-decay on stored records (stale results should carry less weight)
 """
 

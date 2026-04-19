@@ -102,6 +102,32 @@ def test_build_preprocessor_enables_robust_imputation_when_requested():
     assert cat_imputer.fill_value == "__missing__"
 
 
+def test_build_preprocessor_handles_integer_categorical_with_robust_imputation():
+    df = pd.DataFrame({
+        "sex": pd.Series([0, 1, 0, 1, 1, 0], dtype="int64"),
+        "target": [0, 1, 0, 1, 1, 0],
+    })
+    profile = {
+        "shape": {"rows": len(df), "cols": len(df.columns)},
+        "feature_types": {
+            "numeric": {"ordinal": [], "continuous": []},
+            "categorical": {"binary": ["sex"], "multiclass": []},
+            "text": [],
+            "datetime": [],
+            "all_missing": [],
+        },
+        "n_unique_by_col": {"sex": 2, "target": 2},
+        "imbalance_ratio": 1.0,
+        "is_classification": True,
+        "robust_imputation": True,
+    }
+
+    pp = build_preprocessor(profile)
+    transformed = pp.fit_transform(df[["sex"]], df["target"])
+
+    assert transformed.shape[0] == len(df)
+
+
 def test_build_preprocessor_drops_high_cardinality_categoricals():
     rng = np.random.default_rng(0)
     n = 200
@@ -249,6 +275,56 @@ def test_train_models_regression_returns_r2():
     assert "r2" in result["best"]["metrics"]
     assert "mae" in result["best"]["metrics"]
     assert "rmse" in result["best"]["metrics"]
+
+
+def test_train_models_densifies_sparse_features_for_gradient_boosting():
+    df = make_cls_df(n=200)
+    profile = make_profile(df)
+    pp = build_preprocessor(profile)
+    candidates = [("GradientBoosting", modelling.GradientBoostingClassifier(random_state=42))]
+
+    result = train_models(
+        df,
+        "target",
+        pp,
+        candidates,
+        seed=42,
+        test_size=0.2,
+        output_dir=".",
+        is_classification=True,
+    )
+
+    assert result["best"]["name"] == "GradientBoosting"
+    assert "to_dense" in result["best"]["pipeline"].named_steps
+
+
+def test_train_models_adapts_smote_to_tiny_minority_class():
+    rng = np.random.default_rng(7)
+    n_majority = 57
+    n_minority = 3
+    df = pd.DataFrame({
+        "num1": np.concatenate([rng.standard_normal(n_majority), rng.standard_normal(n_minority) + 2]),
+        "num2": np.concatenate([rng.standard_normal(n_majority), rng.standard_normal(n_minority) + 2]),
+        "target": np.array([0] * n_majority + [1] * n_minority),
+    })
+    profile = make_profile(df)
+    pp = build_preprocessor(profile)
+    candidates = [("DummyMostFrequent", modelling.DummyClassifier(strategy="most_frequent"))]
+
+    result = train_models(
+        df,
+        "target",
+        pp,
+        candidates,
+        seed=42,
+        test_size=0.2,
+        output_dir=".",
+        is_classification=True,
+        apply_oversampling=True,
+    )
+
+    assert result["best"]["name"] == "DummyMostFrequent"
+    assert result["best"]["pipeline"].named_steps["smote"].k_neighbors == 1
 
 
 def test_train_models_sorted_best_first_classification():

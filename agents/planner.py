@@ -22,7 +22,6 @@ Implemented:
 
 TODO:
 - Plan templates for unsupported scenarios (datetime-heavy / time-series, etc.)
-- Fallback strategies when initial plan produces no useful result
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,8 +34,10 @@ from config import (
     IMBALANCE_VERY_SEVERE,
     LARGE_DATASET_ROWS,
     MAX_OHE_UNIQUE,
+    MAX_TEXT_UNIQUE_FRAC,
     PLANNER_CV_MAX_COLS,
     PLANNER_CV_MAX_WORKLOAD,
+    POLY_FEATURES_MAX_COLS,
     SEVERE_MISSING_THRESHOLD,
     SMALL_DATASET_ROWS,
     COMPUTE_COST_THRESHOLD,
@@ -125,6 +126,9 @@ def create_plan(
         _append_unique(plan, "use_simple_models_only")
     elif rows >= LARGE_DATASET_ROWS and not high_dimensional:
         _append_unique(plan, "use_ensemble_models")
+        
+    if dataset_profile.get("feature_types", {}).get("datetime", []):
+        _insert_before_unique(plan, "validate_with_cross_validation", "use_time_aware_validation")
 
     # Wide datasets are more prone to overfitting and make complex search
     # disproportionately expensive, even when the row count is moderate.
@@ -148,8 +152,25 @@ def create_plan(
     if high_card_cats or high_card_text:
         _insert_before_unique(plan, "build_preprocessor", "apply_target_encoding")
 
-    if memory_hint and memory_hint.get("best_model"):
-        _append_unique(plan, f"prioritize_model:{memory_hint['best_model']}")
+    if memory_hint:
+        if memory_hint.get("best_model"):
+            _append_unique(plan, f"prioritize_model:{memory_hint['best_model']}")
+            
+        # Meta-learning: pre-emptively apply strategies that successfully fixed issues in prior runs
+        if memory_hint.get("successful_plan"):
+            for step in memory_hint["successful_plan"]:
+                if step in {
+                    "apply_robust_scaling", "handle_outliers", "handle_severe_missing_data", 
+                    "apply_target_encoding", "drop_near_constant_features", "drop_correlated_features", 
+                    "drop_leaky_features", "drop_sensitive_features", "apply_feature_engineering"
+                }:
+                    _insert_before_unique(plan, "build_preprocessor", step)
+                elif step in {"consider_imbalance_strategy", "apply_oversampling", "apply_regularization"}:
+                    _insert_before_unique(plan, "train_models", step)
+                elif step in {"use_simple_models_only", "use_ensemble_models"}:
+                    _insert_before_unique(plan, "select_models", step)
+                elif step == "reduce_tuning_budget" and "tune_hyperparameters" in plan:
+                    _insert_before_unique(plan, "tune_hyperparameters", step)
     
     # Add outlier handling step if the profiler detected outlier-heavy columns
     outlier_cols = dataset_profile.get("outlier_cols", [])
@@ -210,7 +231,7 @@ def create_plan(
 
     # Feature engineering: add polynomial features to capture non-linear relationships,
     # but only if the feature space is very small to avoid combinatorial explosion.
-    if feature_cols <= 15:
+    if feature_cols <= POLY_FEATURES_MAX_COLS:
         _insert_before_unique(plan, "build_preprocessor", "apply_feature_engineering")
     
     return plan

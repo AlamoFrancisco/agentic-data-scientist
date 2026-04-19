@@ -25,6 +25,9 @@ from config import (
     F1_THRESHOLD_BALANCED,
     F1_THRESHOLD_IMBALANCED,
     F1_THRESHOLD_SEVERE_IMBALANCE,
+    OVERFITTING_BAL_ACC_THRESHOLD,
+    OVERFITTING_F1_THRESHOLD,
+    WEAK_CLASS_F1_THRESHOLD,
     IMBALANCE_THRESHOLD,
     IMBALANCE_VERY_SEVERE,
     CV_GAP_THRESHOLD_CLS,
@@ -139,6 +142,7 @@ def reflect(
     all_metrics: List[Dict[str, Any]],
     training_warnings: Optional[List[str]] = None,
     cv_summary: Optional[Dict[str, Any]] = None,
+    plan: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Analyze results and generate reflection with issues and suggestions.
@@ -175,6 +179,8 @@ def reflect(
     hard_leakage = dataset_profile.get("hard_leakage_cols", [])
     soft_leakage = dataset_profile.get("soft_leakage_cols", [])
     sensitive_cols = dataset_profile.get("sensitive_cols", [])
+    is_replan = plan is not None and "replan_attempt" in plan
+    garbage_result = False
 
     if hard_leakage and not dataset_profile.get("drop_leaky"):
         flagged = _format_leakage_evidence(hard_leakage)
@@ -266,14 +272,19 @@ def reflect(
             dummy_r2 = float(dummy.get("r2", 0.0))
             improvement = r2 - dummy_r2
             if improvement < BASELINE_MIN_IMPROVEMENT_REG:
-                issues.append(
-                    f"Best model R² only {improvement:.3f} better than baseline. "
-                    "Weak signal or pipeline issues."
-                )
-                suggestions.append(
-                    "Check for target leakage, verify target quality, "
-                    "or improve feature engineering."
-                )
+                if is_replan:
+                    issues.append("Replan attempted, but best model is still no better than baseline. Data may have no predictable signal.")
+                    suggestions.append("Aborting further replans to save compute.")
+                    garbage_result = True
+                else:
+                    issues.append(
+                        f"Best model R² only {improvement:.3f} better than baseline. "
+                        "Weak signal or pipeline issues."
+                    )
+                    suggestions.append(
+                        "Check for target leakage, verify target quality, "
+                        "or improve feature engineering."
+                    )
         if r2 < R2_LOW_THRESHOLD:
             issues.append(f"R² is very low ({r2:.3f}) — model explains little variance.")
             suggestions.append("Try feature engineering or check if target is predictable.")
@@ -311,6 +322,8 @@ def reflect(
 
         check_cv_consistency(r2, "r2")
 
+        replan_recommended = bool(issues and (r2 < R2_LOW_THRESHOLD or cv_concerns)) and not garbage_result
+
         significance = None
         if cv_summary and cv_summary.get("enabled"):
             significance = _compare_models_statistically(cv_summary)
@@ -326,7 +339,7 @@ def reflect(
             "best_model": best_model,
             "issues": issues,
             "suggestions": _prioritize_suggestions(suggestions),
-            "replan_recommended": bool(issues and (r2 < R2_LOW_THRESHOLD or cv_concerns)),
+            "replan_recommended": replan_recommended,
             "review_required": review_required,
             "training_warnings": training_warnings or [],
             "significance_test": significance,
@@ -341,18 +354,23 @@ def reflect(
         improvement = bal_acc - dummy_ba
 
         if improvement < BASELINE_MIN_IMPROVEMENT_CLS:
-            issues.append(
-                f"Best model only {improvement:.3f} better than baseline. "
-                "Weak signal or pipeline issues."
-            )
-            suggestions.append(
-                "Check for target leakage, verify target quality, "
-                "or improve feature engineering."
-            )
+            if is_replan:
+                issues.append("Replan attempted, but best model is still no better than baseline. Data may have no predictable signal.")
+                suggestions.append("Aborting further replans to save compute.")
+                garbage_result = True
+            else:
+                issues.append(
+                    f"Best model only {improvement:.3f} better than baseline. "
+                    "Weak signal or pipeline issues."
+                )
+                suggestions.append(
+                    "Check for target leakage, verify target quality, "
+                    "or improve feature engineering."
+                )
     
     # Check for overfitting: high balanced accuracy but poor F1 suggests the model
     # is learning the majority class well but failing on minority classes
-    if bal_acc > 0.90 and f1_macro < 0.70:
+    if bal_acc > OVERFITTING_BAL_ACC_THRESHOLD and f1_macro < OVERFITTING_F1_THRESHOLD:
         issues.append("High balanced accuracy but low F1 macro suggests overfitting.")
         suggestions.append(
             "Try regularization, reduce model complexity, or add more data."
@@ -413,7 +431,7 @@ def reflect(
     # Per-class analysis: flag any class the model consistently struggles with
     per_class_f1 = evaluation.get("per_class_f1", {})
     if per_class_f1:
-        weak_classes = [(cls, f1) for cls, f1 in per_class_f1.items() if f1 < 0.4]
+        weak_classes = [(cls, f1) for cls, f1 in per_class_f1.items() if f1 < WEAK_CLASS_F1_THRESHOLD]
         if weak_classes:
             worst_cls, worst_f1 = min(weak_classes, key=lambda x: x[1])
             issues.append(
@@ -460,7 +478,7 @@ def reflect(
     # Determine status
     status = "needs_attention" if issues else "ok"
 
-    replan_recommended = bool(issues and (f1_macro < f1_threshold or cv_concerns))
+    replan_recommended = bool(issues and (f1_macro < f1_threshold or cv_concerns)) and not garbage_result
 
     significance = None
     if cv_summary and cv_summary.get("enabled"):

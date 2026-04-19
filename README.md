@@ -114,7 +114,9 @@ Dataset-adaptive planning based on profiler signals:
 | sensitive columns detected | `drop_sensitive_features` |
 | large tuning workload (`rows * cols` high) | `reduce_tuning_budget` |
 | extreme workload (`rows * cols` very high or feature space very wide) | skip `validate_with_cross_validation` |
+| datetime columns detected | `use_time_aware_validation` (TimeSeriesSplit) |
 | memory hint (prior best model) | `prioritize_model:<name>` |
+| memory hint (successful prior plan) | pre-emptively apply prior successful adaptations (Meta-learning) |
 
 ### 2. Reflector (`agents/reflector.py`)
 Performance-aware reflection with targeted replanning:
@@ -134,6 +136,7 @@ Performance-aware reflection with targeted replanning:
 - Failed target tracking — skips targets that previously produced no useful result
 - Similarity matching across datasets (size bucket, imbalance, missingness)
 - Memory hint passed to Planner to prioritise previously successful models
+- Meta-learning — stores successful plan adaptations to pre-emptively fix issues on similar future runs
 
 ### 5. Data Profiler (`tools/data_profiler.py`)
 Extended profiling signals:

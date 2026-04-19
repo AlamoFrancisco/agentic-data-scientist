@@ -90,6 +90,17 @@ def test_classification_weak_baseline_adds_issue():
     assert any("baseline" in i.lower() for i in result["issues"])
 
 
+def test_classification_weak_baseline_on_replan_aborts():
+    # Best model barely beats dummy, and it's a replan
+    all_m = [
+        {"model": "RandomForest",      "balanced_accuracy": 0.52, "f1_macro": 0.50},
+        {"model": "DummyMostFrequent", "balanced_accuracy": 0.50, "f1_macro": 0.25},
+    ]
+    result = reflect(cls_profile(), cls_eval(0.52, 0.50), all_m, plan=["replan_attempt"])
+    assert result["replan_recommended"] is False
+    assert any("aborting" in s.lower() for s in result["suggestions"])
+
+
 def test_classification_near_perfect_multiple_models_flags_suspicion():
     all_m = [
         {"model": "LogisticRegression", "balanced_accuracy": 1.00, "f1_macro": 1.00},
@@ -143,6 +154,17 @@ def test_regression_weak_baseline_adds_issue():
     ]
     result = reflect(reg_profile(), reg_eval(0.04, model="RF"), all_m)
     assert any("baseline" in i.lower() for i in result["issues"])
+
+
+def test_regression_weak_baseline_on_replan_aborts():
+    # Best r2=0.04, dummy r2=0.03 -> improvement < 0.05, and it's a replan
+    all_m = [
+        {"model": "RF",        "r2": 0.04},
+        {"model": "DummyMean", "r2": 0.03},
+    ]
+    result = reflect(reg_profile(), reg_eval(0.04, model="RF"), all_m, plan=["replan_attempt"])
+    assert result["replan_recommended"] is False
+    assert any("aborting" in s.lower() for s in result["suggestions"])
 
 
 def test_reflection_marks_profile_leakage_as_needs_attention():
@@ -270,7 +292,7 @@ def _cv_summary_with_fold_scores(scores_a, scores_b):
 
 
 def test_significance_test_present_when_cv_enabled():
-    cv = _cv_summary_with_fold_scores([0.90, 0.92, 0.91, 0.93, 0.90], [0.60, 0.62, 0.61, 0.63, 0.60])
+    cv = _cv_summary_with_fold_scores([0.90, 0.92, 0.91, 0.93, 0.90], [0.60, 0.63, 0.61, 0.64, 0.59])
     result = reflect(cls_profile(), cls_eval(0.91, 0.85), cls_all(0.91, 0.85), cv_summary=cv)
     assert result["significance_test"] is not None
     assert "p_value" in result["significance_test"]
@@ -284,7 +306,7 @@ def test_significance_test_none_when_cv_disabled():
 
 def test_significance_test_significant_for_large_gap():
     # 0.90 vs 0.50 across 5 folds — gap is clearly real
-    cv = _cv_summary_with_fold_scores([0.90, 0.91, 0.89, 0.92, 0.90], [0.50, 0.51, 0.49, 0.52, 0.50])
+    cv = _cv_summary_with_fold_scores([0.90, 0.91, 0.89, 0.92, 0.90], [0.50, 0.52, 0.48, 0.53, 0.49])
     result = reflect(cls_profile(), cls_eval(0.90, 0.85), cls_all(0.90, 0.85), cv_summary=cv)
     assert result["significance_test"]["significant"] is True
 

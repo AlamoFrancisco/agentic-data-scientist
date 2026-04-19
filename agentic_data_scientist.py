@@ -162,6 +162,10 @@ class AgenticDataScientist:
         if "tune_hyperparameters" in plan:
             decisions.append("hyperparameter tuning")
             
+        if "use_time_aware_validation" in plan:
+            profile["time_aware_validation"] = True
+            decisions.append("time-aware cross-validation")
+            
         if "reduce_tuning_budget" in plan:
             profile["reduce_tuning_budget"] = True
             decisions.append("reduce tuning budget (cost-aware)")
@@ -627,6 +631,7 @@ class AgenticDataScientist:
                             seed=self.ctx.seed,
                             is_classification=profile.get("is_classification", True),
                             reduce_tuning_budget=profile.get("reduce_tuning_budget", False),
+                            time_aware=profile.get("time_aware_validation", False),
                         )
                         tuned = results.get("best", {}).get("tuned", False)
                         best_params = results.get("best", {}).get("best_params", {})
@@ -647,6 +652,7 @@ class AgenticDataScientist:
                         seed=self.ctx.seed,
                         is_classification=profile.get("is_classification", True),
                         top_k=cv_top_k,
+                        time_aware=profile.get("time_aware_validation", False),
                     )
                     if cv_payload.get("enabled"):
                         self.log(
@@ -672,6 +678,7 @@ class AgenticDataScientist:
                     all_metrics=eval_payload["all_metrics"],
                     training_warnings=results.get("training_warnings", []),
                     cv_summary=cv_payload,
+                    plan=plan,
                 )
                 verdict = derive_run_verdict(profile, eval_payload, reflection)
 
@@ -711,6 +718,7 @@ class AgenticDataScientist:
                 if verdict["label"] == "Reliable result":
                     record["best_model"] = eval_payload["best_metrics"]["model"]
                     record["best_metrics"] = eval_payload["best_metrics"]
+                    record["successful_plan"] = plan
                 else:
                     record["diagnostic_model"] = eval_payload["best_metrics"]["model"]
                     record["diagnostic_metrics"] = eval_payload["best_metrics"]

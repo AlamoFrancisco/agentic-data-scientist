@@ -18,8 +18,15 @@ Implemented:
 
 import os
 import json
+import tempfile
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional
+
+# Matplotlib needs a writable config/cache directory in sandboxed environments.
+if "MPLCONFIGDIR" not in os.environ:
+    mpl_cache_dir = os.path.join(tempfile.gettempdir(), "ce888_ads_mpl")
+    os.makedirs(mpl_cache_dir, exist_ok=True)
+    os.environ["MPLCONFIGDIR"] = mpl_cache_dir
 
 import matplotlib
 import numpy as np
@@ -190,6 +197,7 @@ def _humanize_plan_step(step: str) -> Optional[str]:
         "use_ensemble_models": "Favor ensemble models for a larger dataset.",
         "tune_hyperparameters": "Tune the best model's hyperparameters with randomized search.",
         "reduce_tuning_budget": "Sub-sample data and reduce tuning iterations to stay within compute budget.",
+        "use_time_aware_validation": "Use time-aware cross-validation to prevent future-to-past data leakage.",
     }
     return mapping.get(step, step.replace("_", " ").capitalize() + ".")
 
@@ -790,7 +798,7 @@ def write_markdown_report(
     if fairness_metrics:
         fairness_section += "## Fairness Audit (Demographic Parity)\n\n"
         for col, metrics in fairness_metrics.items():
-            fairness_section += f"**Attribute:** `{col}`\n"
+            fairness_section += f"### Attribute: `{col}`\n"
             fairness_section += f"- **Target Class Evaluated:** `{metrics['evaluated_class']}`\n"
             fairness_section += f"- **Demographic Parity Ratio:** `{metrics['demographic_parity_ratio']}` (Ideal ≈ 1.0)\n"
             fairness_section += "- **Selection Rates by Group:**\n"

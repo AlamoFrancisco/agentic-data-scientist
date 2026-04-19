@@ -38,6 +38,8 @@ SEVERE_MISSING_THRESHOLD = 20.0
 # Categorical cardinality limits for OneHotEncoder vs TargetEncoder
 MAX_OHE_UNIQUE       = 50     # columns with more unique values go to TargetEncoder
 MAX_OHE_UNIQUE_FRAC  = 0.05   # or if unique values > 5% of rows
+MAX_TEXT_UNIQUE_FRAC = 0.10   # text cols with unique values < 10% of rows are treated as categorical
+POLY_FEATURES_MAX_COLS = 15   # max features allowed to trigger polynomial engineering
 
 # Outlier detection: minimum row count before RobustScaler clips extremes
 OUTLIER_CLIP_MIN_ROWS = 1_000
@@ -69,6 +71,9 @@ F1_THRESHOLD_BALANCED          = 0.60   # default: balanced dataset
 F1_THRESHOLD_IMBALANCED        = 0.50   # imbalance ratio >= IMBALANCE_THRESHOLD
 F1_THRESHOLD_SEVERE_IMBALANCE  = 0.45   # imbalance ratio >= IMBALANCE_VERY_SEVERE
 
+OVERFITTING_BAL_ACC_THRESHOLD  = 0.90   # bal_acc above this with low F1 flags overfitting
+OVERFITTING_F1_THRESHOLD       = 0.70   # F1 below this alongside high bal_acc flags overfitting
+WEAK_CLASS_F1_THRESHOLD        = 0.40   # per-class F1 below this triggers an underperforming class issue
 IMBALANCE_VERY_SEVERE = 5.0   # ratio above which F1 threshold is relaxed further
 
 # Cross-validation consistency — how much the held-out split can differ from CV mean
@@ -113,6 +118,9 @@ LEAKAGE_MI_THRESHOLD = 0.90
 
 # Fraction of rows a single value must appear in to flag a near-constant column
 NEAR_CONSTANT_THRESHOLD = 0.95
+
+# Max to median range ratio to trigger robust scaling
+SCALE_MISMATCH_THRESHOLD = 50.0
 
 # Fraction of rows with IQR outliers above which a column is flagged
 OUTLIER_FRACTION_THRESHOLD = 0.05
