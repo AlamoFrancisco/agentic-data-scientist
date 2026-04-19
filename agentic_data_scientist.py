@@ -671,7 +671,15 @@ class AgenticDataScientist:
 
                 # Build preprocessing pipeline tailored to the profile
                 self.log("Building preprocessor...")
-                preprocessor = build_preprocessor(profile)
+                try:
+                    preprocessor = build_preprocessor(profile)
+                except ValueError as e:
+                    if "FeatureDropCascade" in str(e):
+                        self.log("Feature-drop cascade detected (0 features remaining). Target is unlearnable.")
+                        eval_payload = {"best_metrics": {"model": "Dummy"}, "all_metrics": []}
+                        verdict = {"label": "Invalid due to leakage risk", "detail": "All predictive features were removed by ethical and leakage filters."}
+                        break
+                    raise
                 # Choose candidate models to try based on the profile
                 self.log("Selecting candidate models...")
                 preferred_model = self._preferred_model_from_plan(plan)

@@ -221,7 +221,8 @@ def create_plan(
         if p.get("abs_corr", 0) >= HIGH_CORR_DROP_THRESHOLD and target not in (p["col_a"], p["col_b"]):
             cols_to_drop.append(p["col_b"])
     cols_to_drop = list(set(cols_to_drop))
-    if cols_to_drop:
+    # Minimum feature guard: only drop correlated features if we have enough features to spare
+    if cols_to_drop and feature_cols > len(cols_to_drop) + 1:
         dataset_profile["corr_cols_to_drop"] = cols_to_drop
         _insert_before_unique(plan, "build_preprocessor", "drop_correlated_features")
         

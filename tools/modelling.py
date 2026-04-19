@@ -263,6 +263,10 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
         c for c in text_cols
         if MAX_OHE_UNIQUE < n_unique.get(c, 0) < rows * MAX_TEXT_UNIQUE_FRAC
     ]
+
+    # Guard against the feature-drop cascade on tiny datasets
+    if not (ord_cols or cont_cols or bin_cat_cols or multi_cat_cols or high_card_cols):
+        raise ValueError("FeatureDropCascade: 0 features remain after applying leakage, bias, and correlation filters.")
     
     use_robust_scaling = profile.get("use_robust_scaling", False)
     handle_outliers = profile.get("handle_outliers", False)
