@@ -67,7 +67,7 @@ ce888-agentic-data-scientist/
 │
 ├── data/
 │   ├── README.md                 # Dataset documentation and trigger conditions
-│   ├── penguins.csv              # Small classification (344 rows)
+│   ├── wine_sklearn.csv          # Small classification (178 rows)
 │   ├── titanic.csv               # Small classification with leakage (891 rows)
 │   ├── digits.csv                # Medium classification, near-constant features (1797 rows)
 │   ├── Sales.csv                 # Large regression with target encoding (30000 rows)
@@ -160,7 +160,7 @@ Extended profiling signals:
 ### Basic Usage
 
 ```bash
-python3 run_agent.py --data data/penguins.csv --target species
+python3 run_agent.py --data data/wine_sklearn.csv --target wine_class
 ```
 
 ### All Arguments
@@ -207,7 +207,7 @@ See [data/README.md](data/README.md) for full documentation of all datasets and 
 
 | Dataset | Rows | Task | Key triggers |
 |---------|------|------|-------------|
-| `penguins.csv` | 344 | Classification | `apply_regularization`, `apply_robust_scaling` |
+| `wine_sklearn.csv` | 178 | Classification | `apply_regularization`, `use_simple_models_only` |
 | `titanic.csv` | 891 | Classification | `drop_leaky_features` (`alive` col), `handle_outliers` |
 | `digits.csv` | 1797 | Classification | `drop_near_constant_features` (14 border pixels) |
 | `Sales.csv` | 30000 | Regression | `apply_target_encoding`, `drop_sensitive_features`, `reduce_tuning_budget`, soft leakage warning |
@@ -225,7 +225,7 @@ python3 -m pytest tests/
 python3 -m pytest --cov=agents --cov=tools --cov=agentic_data_scientist --cov-report=term tests/
 ```
 
-Current coverage: **87%** total (177 tests, 0 failing).
+Current test suite: **194 tests, 0 failing** in local run.
 
 ---
 
@@ -234,7 +234,7 @@ Current coverage: **87%** total (177 tests, 0 failing).
 - [x] All code runs without errors
 - [x] README.md updated with actual implementation details
 - [x] requirements.txt includes all dependencies (`scikit-learn>=1.3.0`, `imbalanced-learn`)
-- [x] 5 datasets documented in `data/README.md` (4 evaluation + 1 smoke test)
+- [x] Datasets documented in `data/README.md`
 - [x] Technical report completed — `report/REPORT.md` (~4,000 words)
 - [x] Test coverage > 60% (87% achieved)
 - [x] All core components extended significantly

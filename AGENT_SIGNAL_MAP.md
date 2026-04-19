@@ -138,7 +138,7 @@ The executor (`agentic_data_scientist.py` main loop) reads plan steps and sets f
 - `issues` list is non-empty
 - `f1_macro < 0.60` (classification) or `r2 improvement < 0.05` (regression)
 
-This prevents spurious replans when near-perfect performance raises a leakage warning but f1 is already high (e.g. penguins/species).
+This prevents spurious replans when near-perfect performance raises a leakage warning but f1 is already high on a clean, well-separated dataset.
 
 `apply_replan_strategy()` modifies the plan based on issue text:
 | Issue keyword | Plan step added |

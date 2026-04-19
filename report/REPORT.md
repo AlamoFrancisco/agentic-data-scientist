@@ -194,7 +194,7 @@ Suggestions are ordered by estimated impact before being returned. High-priority
 
 ### Replanning
 
-`should_replan()` defers entirely to `replan_recommended`. An earlier implementation also triggered replanning when multiple issues were present or status was `needs_attention` — this caused spurious replans on the penguins dataset where near-perfect performance is legitimate, not a problem. The fix was to make `replan_recommended` the single gate, set only when performance is genuinely poor.
+`should_replan()` defers entirely to `replan_recommended`. An earlier implementation also triggered replanning when multiple issues were present or status was `needs_attention` — this caused spurious replans on clean, well-separated datasets where near-perfect performance is legitimate, not a problem. The fix was to make `replan_recommended` the single gate, set only when performance is genuinely poor.
 
 `apply_replan_strategy()` modifies the plan based on issue keywords. If overfitting is detected, `apply_regularization` is added. If F1 is weak or the best model only marginally beats the baseline, `use_ensemble_models` is added — this step is handled by the executor, which sets `prefer_ensemble=True` in the profile, causing `select_models()` to include GradientBoosting-style ensembles. If training instability was flagged, `apply_robust_scaling` is added to address potential feature scale issues in the next pass. When the held-out score diverges materially from the cross-validation mean, the replanner also sets `increase_test_size=True`, widening the test split by 0.10 (capped at 0.35) for the next pass so the held-out estimate is more representative.
 
