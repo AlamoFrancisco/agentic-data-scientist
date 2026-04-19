@@ -51,7 +51,7 @@ import numpy as np
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler, RobustScaler, TargetEncoder
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, RobustScaler, TargetEncoder, PolynomialFeatures
 from sklearn.model_selection import (
     KFold,
     StratifiedKFold,
@@ -186,10 +186,14 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
         categorical_imputer = SimpleImputer(strategy="most_frequent")
         high_card_imputer = SimpleImputer(strategy="most_frequent")
 
-    continuous_transformer = Pipeline(steps=[
+    continuous_steps = [
         ("imputer", continuous_imputer),
-        ("scaler", scaler),
-    ])
+    ]
+    if profile.get("use_feature_engineering"):
+        continuous_steps.append(("poly", PolynomialFeatures(degree=2, include_bias=False)))
+    continuous_steps.append(("scaler", scaler))
+
+    continuous_transformer = Pipeline(steps=continuous_steps)
 
     ordinal_transformer = Pipeline(steps=[
         ("imputer", ordinal_imputer),
@@ -593,6 +597,7 @@ def _param_grid(model_name: str) -> Dict[str, List[Any]]:
         },
         "LogisticRegression": {
             "model__C": [0.01, 0.1, 1.0, 10.0, 100.0],
+            "model__penalty": ["l1", "l2"],
         },
         "Ridge": {
             "model__alpha": [0.01, 0.1, 1.0, 10.0, 100.0],

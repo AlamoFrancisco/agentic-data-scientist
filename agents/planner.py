@@ -107,19 +107,30 @@ def create_plan(
         "write_report",
     ]
 
+    rows = int(dataset_profile["shape"]["rows"])
+    cols = int(dataset_profile["shape"]["cols"])
+    complexity = rows * cols
+    feature_cols = _feature_count(cols)
+    high_dimensional = _is_high_dimensional(rows, cols)
+
     imb = dataset_profile.get("imbalance_ratio") or 1.0
     if imb >= IMBALANCE_VERY_SEVERE:
-        plan.insert(plan.index("train_models"), "apply_oversampling")
+        _insert_before_unique(plan, "train_models", "apply_oversampling")
     elif imb >= IMBALANCE_THRESHOLD:
-        plan.insert(plan.index("train_models"), "consider_imbalance_strategy")
+        _insert_before_unique(plan, "train_models", "consider_imbalance_strategy")
 
-    # Size bucket — drives model complexity and regularization
-    rows = dataset_profile["shape"]["rows"]
+    # Size bucket — drives model complexity and regularization.
     if rows < SMALL_DATASET_ROWS:
-        plan.append("apply_regularization")
-        plan.append("use_simple_models_only")
-    elif rows >= LARGE_DATASET_ROWS:
-        plan.append("use_ensemble_models")
+        _append_unique(plan, "apply_regularization")
+        _append_unique(plan, "use_simple_models_only")
+    elif rows >= LARGE_DATASET_ROWS and not high_dimensional:
+        _append_unique(plan, "use_ensemble_models")
+
+    # Wide datasets are more prone to overfitting and make complex search
+    # disproportionately expensive, even when the row count is moderate.
+    if high_dimensional:
+        _append_unique(plan, "apply_regularization")
+        _append_unique(plan, "use_simple_models_only")
     
     # High-cardinality categoricals: check multiclass AND text columns.
     # Text cols are high-cardinality strings — those with n_unique < 10% of rows
@@ -135,48 +146,52 @@ def create_plan(
         if MAX_OHE_UNIQUE < n_unique.get(c, 0) < rows * 0.10
     ]
     if high_card_cats or high_card_text:
-        plan.insert(plan.index("build_preprocessor"), "apply_target_encoding")
+        _insert_before_unique(plan, "build_preprocessor", "apply_target_encoding")
 
     if memory_hint and memory_hint.get("best_model"):
-        plan.append(f"prioritize_model:{memory_hint['best_model']}")
+        _append_unique(plan, f"prioritize_model:{memory_hint['best_model']}")
     
     # Add outlier handling step if the profiler detected outlier-heavy columns
     outlier_cols = dataset_profile.get("outlier_cols", [])
     if outlier_cols:
-        plan.insert(plan.index("build_preprocessor"), "handle_outliers")
+        _insert_before_unique(plan, "build_preprocessor", "handle_outliers")
 
     missing_pct = dataset_profile.get("missing_pct", {})
     if missing_pct:
         max_missing = max(missing_pct.values())
         if max_missing > SEVERE_MISSING_THRESHOLD:
-            plan.insert(plan.index("build_preprocessor"), "handle_severe_missing_data")
+            _insert_before_unique(plan, "build_preprocessor", "handle_severe_missing_data")
 
     # Hyperparameter tuning: worthwhile for medium/large datasets where the
-    # extra compute is justified; skip for small datasets to stay fast.
-    if rows >= SMALL_DATASET_ROWS:
-        plan.insert(plan.index("evaluate"), "tune_hyperparameters")
-        
-        # Cost-aware planning: estimate compute cost (rows * cols)
-        complexity = rows * dataset_profile["shape"]["cols"]
+    # extra compute is justified; skip for small or wide datasets to stay fast.
+    if rows >= SMALL_DATASET_ROWS and not high_dimensional:
+        _insert_before_unique(plan, "evaluate", "tune_hyperparameters")
+
         if complexity > COMPUTE_COST_THRESHOLD:
             dataset_profile["reduce_tuning_budget"] = True
-            plan.insert(plan.index("tune_hyperparameters"), "reduce_tuning_budget")
+            _insert_before_unique(plan, "tune_hyperparameters", "reduce_tuning_budget")
+
+    # Cross-validation is useful by default, but very wide / extreme workloads
+    # should skip it to keep the plan compute-aware.
+    if complexity > PLANNER_CV_MAX_WORKLOAD or feature_cols >= PLANNER_CV_MAX_COLS:
+        if "validate_with_cross_validation" in plan:
+            plan.remove("validate_with_cross_validation")
 
     # Use robust scaling when scale mismatch detected
     if dataset_profile.get("scale_mismatch"):
-        plan.insert(plan.index("build_preprocessor"), "apply_robust_scaling")
+        _insert_before_unique(plan, "build_preprocessor", "apply_robust_scaling")
 
     # Automatically drop only hard leakage evidence. Soft leakage signals should
     # trigger review, not silent feature removal.
     hard_leaky_cols = [c["column"] for c in dataset_profile.get("hard_leakage_cols", [])]
     if hard_leaky_cols:
         dataset_profile["leaky_col_names"] = hard_leaky_cols
-        plan.insert(plan.index("build_preprocessor"), "drop_leaky_features")
+        _insert_before_unique(plan, "build_preprocessor", "drop_leaky_features")
 
     # Drop near-constant features — they carry no signal and inflate one-hot encoding
     near_constant_cols = dataset_profile.get("near_constant_cols", [])
     if near_constant_cols:
-        plan.insert(plan.index("build_preprocessor"), "drop_near_constant_features")
+        _insert_before_unique(plan, "build_preprocessor", "drop_near_constant_features")
 
     # Drop highly correlated features (abs_corr >= 0.95) — likely redundant or leaky
     high_corr_pairs = dataset_profile.get("high_corr_pairs", [])
@@ -185,13 +200,18 @@ def create_plan(
     })
     if cols_to_drop:
         dataset_profile["corr_cols_to_drop"] = cols_to_drop
-        plan.insert(plan.index("build_preprocessor"), "drop_correlated_features")
+        _insert_before_unique(plan, "build_preprocessor", "drop_correlated_features")
         
     # Drop sensitive features to mitigate direct algorithmic bias
     sensitive_cols = dataset_profile.get("sensitive_cols", [])
     if sensitive_cols:
         dataset_profile["drop_sensitive"] = True
-        plan.insert(plan.index("build_preprocessor"), "drop_sensitive_features")
+        _insert_before_unique(plan, "build_preprocessor", "drop_sensitive_features")
+
+    # Feature engineering: add polynomial features to capture non-linear relationships,
+    # but only if the feature space is very small to avoid combinatorial explosion.
+    if feature_cols <= 15:
+        _insert_before_unique(plan, "build_preprocessor", "apply_feature_engineering")
     
     return plan
 
@@ -229,32 +249,27 @@ def apply_replan_strategy(
 
     # Overfitting: strengthen regularization
     if "overfitting" in issues_lower:
-        if "apply_regularization" not in new_plan:
-            new_plan.insert(new_plan.index("train_models"), "apply_regularization")
+        _insert_before_unique(new_plan, "train_models", "apply_regularization")
 
     # Severe imbalance with weak baseline margin: ensure class weights are applied
     if "imbalance" in issues_lower:
-        if "consider_imbalance_strategy" not in new_plan:
-            new_plan.insert(new_plan.index("train_models"), "consider_imbalance_strategy")
+        _insert_before_unique(new_plan, "train_models", "consider_imbalance_strategy")
 
     # Low F1 or weak-vs-baseline: switch to ensemble models for more predictive power
     if "f1" in issues_lower or "baseline" in issues_lower:
-        if "use_ensemble_models" not in new_plan:
-            new_plan.append("use_ensemble_models")
+        _append_unique(new_plan, "use_ensemble_models")
 
     # Numerical instability: apply robust scaling if not already planned
     if "instability" in issues_lower or "scaling" in issues_lower:
-        if "apply_robust_scaling" not in new_plan:
-            new_plan.insert(new_plan.index("build_preprocessor"), "apply_robust_scaling")
+        _insert_before_unique(new_plan, "build_preprocessor", "apply_robust_scaling")
 
     # CV gap: held-out score diverges from cross-validation mean.
     # Strengthen regularization to reduce variance between splits, and widen
     # the test set so the held-out estimate is more representative.
     if "cross-validation mean" in issues_lower:
-        if "apply_regularization" not in new_plan:
-            new_plan.insert(new_plan.index("train_models"), "apply_regularization")
+        _insert_before_unique(new_plan, "train_models", "apply_regularization")
         new_profile["increase_test_size"] = True
 
-    new_plan.append("replan_attempt")
+    _append_unique(new_plan, "replan_attempt")
 
     return new_plan, new_profile

@@ -6,7 +6,7 @@ This guide will help you set up your development environment and get started wit
 
 ## Prerequisites
 
-- **Python 3.7 or higher** (recommended: Python 3.9+)
+- **Python 3.9 or higher** (tested on 3.11)
 - **Git** for version control
 - **Text editor or IDE** (VS Code, PyCharm, Sublime, etc.)
 - **Terminal/Command Line** access
@@ -17,10 +17,10 @@ This guide will help you set up your development environment and get started wit
 
 ```bash
 # Clone the repository
-git clone https://github.com/[your-institution]/ce888-agentic-data-scientist.git
+git clone https://github.com/AlamoFrancisco/agentic-data-scientist.git
 
 # Navigate into the directory
-cd ce888-agentic-data-scientist
+cd agentic-data-scientist
 ```
 
 ---
@@ -64,11 +64,11 @@ pip install -r requirements.txt
 ```
 
 This will install:
-- pandas (data manipulation)
-- numpy (numerical operations)
+- pandas, numpy, scipy (data/numerical)
 - scikit-learn (machine learning)
+- imbalanced-learn (SMOTE oversampling)
 - matplotlib (visualization)
-- pytest (testing)
+- pytest, pytest-cov (testing)
 
 ---
 
@@ -207,14 +207,6 @@ Steps to use it safely:
 
 # Reinstall dependencies
 pip install -r requirements.txt
-```
-
-### Issue: `ImportError: cannot import name 'dataclasses'`
-
-**Solution:**
-```bash
-# For Python < 3.7
-pip install dataclasses
 ```
 
 ### Issue: Permission denied on script execution
@@ -376,11 +368,14 @@ deactivate
 3. ✅ Install dependencies
 4. ✅ Run basic example
 5. ✅ Run sanity check
-6. → Read the assignment brief thoroughly
-7. → Understand the skeleton code
-8. → Start extending Planner and Reflector
-9. → Test continuously
-10. → Document as you go
+6. ✅ Read the assignment brief thoroughly
+7. ✅ Understand the skeleton code
+8. ✅ Start extending Planner and Reflector
+9. ✅ Test continuously
+10. ✅ Document as you go
+11. ✅ Write technical report
+12. ✅ Prepare demonstration
+13. ✅ Practice timing
 
 ---
 

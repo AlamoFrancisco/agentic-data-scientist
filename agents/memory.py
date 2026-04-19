@@ -118,11 +118,16 @@ class JSONMemory:
         # If a record with the same target + shape already exists, update it in place
         target = record.get("target")
         shape = record.get("shape")
-        for existing_fp, existing_record in datasets.items():
-            if existing_record.get("target") == target and existing_record.get("shape") == shape:
-                datasets[existing_fp] = record
-                self.save()
-                return
+        
+        old_fp = None
+        if target and shape:
+            for existing_fp, existing_record in datasets.items():
+                if existing_record.get("target") == target and existing_record.get("shape") == shape:
+                    old_fp = existing_fp
+                    break
+        if old_fp and old_fp != fingerprint:
+            del datasets[old_fp]
+            
         # No match — new dataset, store under the fingerprint key
         datasets[fingerprint] = record
         self.save()
@@ -150,6 +155,10 @@ class JSONMemory:
         
         # Loop through all stored dataset records in memory
         for fingerprint, record in self.data.get("datasets", {}).items():
+            # Only transfer knowledge from successful prior runs
+            if not self._is_reliable_record(record):
+                continue
+                
             # Calculate how similar this stored record is to the current profile
             score = self._similarity_score(profile, record)
             # Only update if this is the best match so far AND above the threshold

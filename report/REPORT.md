@@ -9,15 +9,15 @@
 
 ## 1. Introduction
 
-The goal of this project is to build an autonomous, offline data scientist agent capable of performing end-to-end machine learning pipelines without human intervention or reliance on Large Language Models. The agent must profile datasets, plan preprocessing and modelling strategies, train and evaluate candidate models, reflect on results, and learn from experience across runs — all driven by rule-based logic and heuristics.
+The goal of this project is to build an autonomous, offline data scientist agent that can execute end-to-end machine learning workflows without human intervention or reliance on Large Language Models. The agent profiles datasets, plans preprocessing and modelling strategies, trains and evaluates candidate models, reflects on results, and reuses prior experience through rule-based logic and heuristics.
 
-The motivation for an agentic approach is that data science workflows are inherently conditional. The right preprocessing strategy depends on the data: a dataset with severe class imbalance needs different treatment than a balanced one; a dataset with highly correlated features calls for feature selection; a small dataset risks overfitting with complex models. A static pipeline cannot adapt. An agent that reads the data, reasons about it, and adjusts its plan accordingly is both more principled and more practical.
+Data science workflows are inherently conditional. A dataset with severe class imbalance needs different treatment than a balanced one; highly correlated features call for feature selection; a small dataset risks overfitting with complex models. A static pipeline cannot adapt to those cases, so the system is designed to read the data profile and adjust its plan accordingly.
 
-The design philosophy throughout this project was to make every decision traceable. Rather than applying all preprocessing steps by default, each step is gated behind a profile signal. This means the output plan — logged per run — acts as an explanation of why specific adaptations were made. For example, when `drop_leaky_features` appears in the plan, it is because the profiler measured a normalised mutual information score ≥ 0.9 between that feature and the target. This transparency distinguishes an agentic system from a fixed sklearn pipeline.
+The design philosophy throughout the project was to keep every decision traceable. Rather than applying all preprocessing steps by default, each step is gated behind a profile signal, so the generated plan doubles as an explanation of why specific adaptations were made. For example, when `drop_leaky_features` appears in the plan, it is because the profiler measured a normalised mutual information score ≥ 0.9 between that feature and the target.
 
-A secondary design goal was robustness. The agent includes a training retry loop (up to 3 attempts), memory-guided model prioritisation, and failed-target tracking. These mechanisms reduce the chance that a single bad run wastes time or misleads subsequent runs.
+Robustness was a secondary design goal. The agent includes a training retry loop (up to 3 attempts), memory-guided model prioritisation, and failed-target tracking so that one poor run does not waste time or contaminate later runs.
 
-This report describes the design and implementation of each component — Planner, Executor, Modelling tools, Reflector, and Memory — alongside the signals that drive decisions, the adaptations made beyond the skeleton code, and the limitations identified through testing.
+This report summarises the main design decisions, extensions beyond the skeleton, and the limitations identified through testing.
 
 ---
 
@@ -38,7 +38,7 @@ Dataset → Profiler → Planner → Executor → Modelling → Evaluator
 - **Executor** (`agentic_data_scientist.py`): Iterates over the plan, sets configuration flags on the profile, builds the preprocessor and model candidates, trains and evaluates, then reflects. If reflection recommends a replan, the cycle repeats up to `max_replans` times.
 - **Modelling** (`tools/modelling.py`): Provides `build_preprocessor()` which constructs a `ColumnTransformer` from profile flags, and `select_models()` which returns a size-appropriate set of candidate models.
 - **Reflector** (`agents/reflector.py`): Analyses evaluation metrics against dataset characteristics and returns a structured reflection containing issues, suggestions, and a `replan_recommended` flag.
-- **Memory** (`agents/memory.py`): Persists outcomes per dataset fingerprint. Provides lookup by fingerprint, filename, or target+shape. Also tracks failed targets to avoid repeating them on subsequent runs.
+- **Memory** (`agents/memory.py`): Persists outcomes per dataset fingerprint. Provides lookup by fingerprint, filename, or target+shape, reuses only reliable runs as priors, and tracks failed targets to avoid repeating them on subsequent runs.
 
 ---
 
@@ -49,14 +49,16 @@ The profiler extracts a rich set of signals from every dataset. The table below 
 | Signal | How detected | Downstream effect |
 |--------|-------------|-------------------|
 | `shape.rows` | Row count | Size bucket: small (<1000), medium (1000–9999), large (≥10000) |
-| `imbalance_ratio` | majority/minority class count | ≥3.0 → class-weighted models; suggestion to consider SMOTE |
+| `imbalance_ratio` | majority/minority class count | ≥3.0 → class-weighted models; ≥5.0 → oversampling step |
 | `missing_pct` | % NaN per column | >20% → `handle_severe_missing_data`; columns above threshold dropped |
 | `outlier_cols` | IQR-based outlier count >5% | `handle_outliers` → RobustScaler |
 | `scale_mismatch` | max_range / median_range ≥ 50 | `apply_robust_scaling` → RobustScaler instead of StandardScaler |
-| `leaky_cols` | Normalised mutual information ≥ 0.9 with target | `drop_leaky_features` → column excluded from all transformers |
+| `hard_leakage_cols` | Hard leakage evidence from mutual information analysis | `drop_leaky_features` → column excluded from all transformers |
+| `soft_leakage_cols` | High-MI proxy suspicion | surfaced to verdict / human review rather than auto-drop |
 | `high_corr_pairs` | Pairwise Pearson abs_corr ≥ 0.95 | `drop_correlated_features` → weaker of each pair dropped |
 | `near_constant_cols` | One value ≥ 95% dominant | `drop_near_constant_features` → column excluded |
 | `n_unique_by_col` | Unique value count per column | >50 unique + <10% of rows → `apply_target_encoding` |
+| `sensitive_cols` | Column-name keyword match | `drop_sensitive_features` → excluded before training |
 | `is_classification` | Target cardinality and dtype | Routes to classification or regression models and metrics |
 
 A key implementation decision was the **leakage detection fix**. The original skeleton passed the regression target through `pd.factorize()` before computing `mutual_info_regression`, converting continuous values into integer rank labels. This broke the MI normalisation — with 30,000 near-unique values, the target entropy denominator became enormous, collapsing all normalised MI scores below the 0.9 threshold. After the fix, regression leakage is detected correctly by using raw target values and normalising by the maximum MI score instead of target entropy. This allowed `final_price_usd` (normalised MI = 1.0) to be correctly flagged as leaky in the Sales dataset, where `revenue_usd = final_price_usd × units_sold` exactly.
@@ -70,9 +72,11 @@ The planner generates an ordered plan by applying a series of conditional checks
 **Size bucket logic** drives model selection and regularization:
 - Rows < 1000 (small): `apply_regularization` (LogisticRegression C=0.1) and `use_simple_models_only` (Dummy + LR + RF only, no GradientBoosting or SVC)
 - Rows 1000–9999 (medium): full model set including GradientBoosting
-- Rows ≥ 10,000 (large): `use_ensemble_models` (GradientBoosting always included)
+- Rows ≥ 10,000 (large): `use_ensemble_models` (tree ensembles favoured unless the dataset is too wide)
 
 This bucket logic is consistent across the planner, modelling, and memory components — all three use the same thresholds of 1,000 and 10,000.
+
+Two additional planner extensions improve realism beyond a simple size bucket. First, **high-dimensional routing** treats wide datasets (`feature_cols >= 100` or `feature_cols / rows >= 0.25`) as overfitting-prone even when they are not row-small, so the planner biases toward regularization and simpler candidate sets rather than blindly favouring ensembles. Second, **cost-aware planning** estimates workload as `rows * cols`; large workloads trigger `reduce_tuning_budget` so hyperparameter search uses fewer iterations and optional row sub-sampling, while extreme workloads can skip cross-validation entirely.
 
 **Memory-guided planning** uses prior run outcomes. If a previous fingerprint match exists in memory and recorded a best-performing model, the planner adds `prioritize_model:<name>` to the plan. The modelling layer then places that model first in the candidate list, ensuring it is trained even if the run is later truncated. This was observed in practice on the Titanic dataset: the second run correctly prioritised `LogisticRegression` based on the first run's memory record.
 
@@ -97,10 +101,10 @@ Models are selected based on the size bucket and profile flags:
 
 | Condition | Models |
 |-----------|--------|
-| `simple_models_only` (small dataset) | DummyClassifier, LogisticRegression, RandomForest |
-| Medium / Large (classification) | + GradientBoosting |
-| `prefer_ensemble` (large) | GradientBoosting always included |
-| Regression | DummyRegressor, LinearRegression, RandomForestRegressor, GradientBoostingRegressor |
+| `simple_models_only` (small / wide dataset) | DummyClassifier, LogisticRegression, RandomForest |
+| Medium / Large (classification) | + GradientBoosting, HistGradientBoosting |
+| `prefer_ensemble` (large) | tree ensembles explicitly favoured |
+| Regression | DummyRegressor, LinearRegression, Ridge, RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor |
 
 A dummy baseline is always included. This is critical for the reflector — all performance assessments are relative to baseline improvement.
 
@@ -192,7 +196,7 @@ Suggestions are ordered by estimated impact before being returned. High-priority
 
 `should_replan()` defers entirely to `replan_recommended`. An earlier implementation also triggered replanning when multiple issues were present or status was `needs_attention` — this caused spurious replans on the penguins dataset where near-perfect performance is legitimate, not a problem. The fix was to make `replan_recommended` the single gate, set only when performance is genuinely poor.
 
-`apply_replan_strategy()` modifies the plan based on issue keywords. If overfitting is detected, `apply_regularization` is added. If F1 is weak or the best model only marginally beats the baseline, `use_ensemble_models` is added — this step is handled by the executor, which sets `prefer_ensemble=True` in the profile, causing `select_models()` to include GradientBoosting. If training instability was flagged, `apply_robust_scaling` is added to address potential feature scale issues in the next pass.
+`apply_replan_strategy()` modifies the plan based on issue keywords. If overfitting is detected, `apply_regularization` is added. If F1 is weak or the best model only marginally beats the baseline, `use_ensemble_models` is added — this step is handled by the executor, which sets `prefer_ensemble=True` in the profile, causing `select_models()` to include GradientBoosting-style ensembles. If training instability was flagged, `apply_robust_scaling` is added to address potential feature scale issues in the next pass. When the held-out score diverges materially from the cross-validation mean, the replanner also sets `increase_test_size=True`, widening the test split by 0.10 (capped at 0.35) for the next pass so the held-out estimate is more representative.
 
 ---
 
@@ -202,19 +206,21 @@ The memory system (`agents/memory.py`) persists outcomes in a JSON file (`agent_
 
 - `dataset`: filename
 - `target`: column name
-- `target_source`: whether it was provided manually, inferred, or read from memory
+- `target_source` / `target_origin`: whether it was provided manually, inferred, or read from memory
 - `shape`: rows and columns
 - `is_classification`: task type
-- `best_model`: name of the best-performing model
-- `best_metrics`: full metrics dict
+- `verdict_label` and `verdict_detail`: run-level trust outcome
 - `reflection_status`: `"ok"` or `"needs_attention"`
+- `review_required`: whether human review is explicitly recommended
+- `best_model` + `best_metrics` for reliable runs, or `diagnostic_model` + `diagnostic_metrics` otherwise
+- `cross_validation`: stored when CV was executed
 - `last_seen`: UTC timestamp
 
 **Lookup** operates in three steps: exact fingerprint, then filename, then target+shape. This means a renamed copy of a dataset still gets a memory hit, enabling continuity across experiments.
 
 **Model prioritisation**: When memory returns a best model, the planner adds `prioritize_model:<name>` to the plan. This was observed to improve second-run efficiency on the Titanic dataset, where memory correctly identified `LogisticRegression` as the best-performing model.
 
-**Failed target tracking**: A dedicated `failed_targets` dict records targets that produced no useful results (best model is Dummy + status is `needs_attention`). On subsequent auto-detection runs, those targets are skipped. This was tested with `Sales.csv` where `category` as a target produced random-level predictions — the agent stored it as failed and skipped to the next candidate on the following run.
+**Failed target tracking**: A dedicated `failed_targets` dict records targets that produced no useful results (best model is Dummy + status is `needs_attention`) or were marked invalid because of leakage risk. On subsequent auto-detection runs, those targets are skipped. This was tested with `Sales.csv` where `category` as a target produced random-level predictions — the agent stored it as failed and skipped to the next candidate on the following run.
 
 **Similarity matching** (`get_similar_record`) finds records from structurally similar datasets using three heuristics: same size bucket, similar imbalance level, similar missingness. This enables cross-dataset transfer of strategies when no exact fingerprint match exists.
 
@@ -226,16 +232,16 @@ The memory system (`agents/memory.py`) persists outcomes in a JSON file (`agent_
 The agent detects leakage through mutual information analysis but only at the individual feature level. Multiplicative relationships (e.g., `revenue_usd = final_price_usd × units_sold`) are not detected because neither component alone reaches the MI threshold. The reflector's near-perfect performance check acts as a secondary signal, correctly flagging this case as suspicious even when the feature-level detector misses it.
 
 ### Proxy Features and Fairness
-The leakage detector flags features that are near-perfect proxies of the target. However, it does not assess whether features encode protected characteristics (e.g., gender, race). The agent makes no fairness-aware adjustments to model selection or thresholds.
+The leakage detector flags features that are near-perfect proxies of the target. Additionally, the profiler actively scans for sensitive attributes (e.g., gender, race, age) and automatically drops them to prevent direct algorithmic bias. During the evaluation phase, the agent computes a Demographic Parity proxy to audit the model for disparate impacts across protected groups, ensuring fairness issues are surfaced to human reviewers.
 
 ### Imbalance Handling
-Class weights are applied automatically when imbalance ratio ≥ 3.0, but SMOTE and oversampling are not implemented. For severe imbalance (ratio ≥ 10), class weights alone may be insufficient.
+Class weights are applied automatically when imbalance ratio ≥ 3.0. For severe imbalance (ratio ≥ 5.0), the planner dynamically injects an oversampling step that utilises SMOTE (Synthetic Minority Over-sampling Technique) to artificially balance the training data, provided the `imbalanced-learn` library is available.
 
-### Known Dead Flags
-One plan step sets a profile flag that is not yet fully implemented:
-- `use_feature_engineering`: the planner can emit this step but no feature engineering transformations are applied by the executor
+### Feature Engineering
+When the planner emits `apply_feature_engineering`, the executor dynamically injects a `PolynomialFeatures(degree=2)` step into the continuous data preprocessing pipeline. This automatically generates interaction terms and squared features, allowing simpler linear models to capture non-linear relationships without manual domain knowledge.
 
-This represents a known limitation that would be addressed in a production system. All other previously dead flags have been resolved: `robust_imputation` now correctly switches the imputer to median imputation with missing-value indicators, and `use_ensemble_models` (the replacement for the earlier dead `try_ensemble_methods`) is handled by the executor and sets `prefer_ensemble=True` in the profile.
+### Resolved Limitations
+All previously dead flags from the original skeleton have been resolved: `robust_imputation` now correctly switches the imputer to median imputation with missing-value indicators, `use_ensemble_models` (the replacement for the earlier dead `try_ensemble_methods`) is handled by the executor and sets `prefer_ensemble=True` in the profile, `drop_sensitive_features` successfully drops sensitive attributes before training to prevent direct algorithmic bias, and `apply_oversampling` natively integrates SMOTE to handle severe imbalance.
 
 ### Replan Effectiveness
 The replan mechanism works correctly for performance-based issues (weak F1, poor R²). For structural issues like multiplicative leakage, the replanner currently has no handler — it adds `replan_attempt` to the plan but changes nothing in the second run. The correct fix would be to progressively lower the MI leakage threshold during replanning, catching features that individually fall below 0.9 but together construct the target.
@@ -254,15 +260,15 @@ Four datasets were used to validate the agent across different scenarios:
 | `penguins.csv` | 344 | Classification | LogisticRegression | bal_acc=1.000, f1=1.000 | regularization, simple_models_only, robust_scaling |
 | `titanic.csv` | 784 | Classification | LogisticRegression | bal_acc=0.825, f1=0.828 | outliers, missing_data, robust_scaling, leaky `alive` dropped, CV-gap replan |
 | `digits.csv` | 1797 | Classification | RandomForest | bal_acc=0.972, f1=0.972 | outliers, 14 near-constant pixel cols dropped |
-| `Sales.csv` | 30000 | Regression | RandomForestRegressor | R²=1.000 (suspicious) | target_encoding, soft leakage flagged for `final_price_usd`, ensemble |
+| `Sales.csv` | 30000 | Regression | RandomForestRegressor | R²=1.000 (suspicious) | target_encoding, sensitive feature dropped, reduced tuning budget, soft leakage review |
 
-**Penguins (species classification):** The agent correctly identified this as a small dataset (344 rows) and applied regularisation and simple model selection. Both LogisticRegression and RandomForest achieved near-perfect balanced accuracy of 1.000. The reflector flagged this as suspicious near-perfect performance, which is a false positive in this case — the penguin species target is genuinely well-separated by bill and flipper measurements, making it a trivially easy classification problem. This highlights a known limitation: the near-perfect check cannot distinguish genuine separability from data leakage without inspecting feature semantics.
+**Penguins (species classification):** The agent correctly identified this as a small dataset (344 rows) and applied regularisation and simple model selection. Both LogisticRegression and RandomForest achieved near-perfect balanced accuracy of 1.000. The reflector flagged this as suspicious near-perfect performance, but this is a false positive: penguin species are genuinely easy to separate from bill and flipper measurements. This highlights a known limitation: the near-perfect check cannot distinguish genuine separability from data leakage without inspecting feature semantics.
 
 **Titanic (survival classification):** The Titanic run demonstrates several adaptive behaviours working together. The `alive` column — a string encoding of whether the passenger survived — was correctly flagged as leaky via mutual information (normalised MI = 1.0) and dropped before training. The `deck` column (77% missing values) triggered `handle_severe_missing_data`. Scale mismatch between `fare` (0–512) and ordinal features like `pclass` (1–3) triggered RobustScaler. The held-out score (balanced accuracy 0.853) differed noticeably from the 5-fold cross-validation mean (0.770), triggering the CV-gap replan: the test split was widened from 20% to 30% to obtain a more representative held-out estimate. After the replan, LogisticRegression achieved balanced accuracy 0.825 and macro F1 0.828 — a strong outcome for this well-studied dataset, achieved through fully automated adaptive preprocessing. Memory was correctly updated and the second run prioritised LogisticRegression, improving run efficiency.
 
 **Digits (handwritten digit classification):** The digits dataset contains 64 pixel features derived from 8×8 images. Border pixels are always or nearly always zero — 14 columns were flagged as near-constant (dominant value ≥ 95%) and dropped. RandomForest achieved balanced accuracy 0.972 and macro F1 0.972 on 10-class digit recognition, a strong result. The plan included `handle_outliers` and `drop_near_constant_features`, demonstrating that the profile correctly identified the dataset's structural characteristics without any human guidance.
 
-**Sales (revenue regression):** The Sales dataset provided the most instructive run. `final_price_usd` was correctly flagged as a soft leakage signal (normalised MI = 1.0 with `revenue_usd`) and `model_name` (899 unique product names) was target-encoded rather than dropped. Soft leakage signals are not automatically removed — they surface as `Use with caution` verdicts requiring human review, because high MI alone is not proof that a feature is unavailable at prediction time. With `final_price_usd` still in the feature set (along with `units_sold`), RandomForestRegressor achieved R² = 1.000 trivially, since `revenue_usd = final_price_usd × units_sold` exactly. The reflector correctly raised a `needs_attention` warning with a suspicious near-perfect R² issue. This demonstrates both the strength of the leakage detector (caught the high-MI proxy and surfaced it) and the intentional design choice to prefer human review over silent feature removal for soft signals.
+**Sales (revenue regression):** The Sales dataset provided the most instructive run. `final_price_usd` was correctly flagged as a soft leakage signal (normalised MI = 1.0 with `revenue_usd`) and `model_name` (899 unique product names) was target-encoded rather than dropped. The planner also dropped the sensitive `gender` column and reduced the tuning budget because the workload was large (`30,000 × 18`). Soft leakage signals are not automatically removed — they surface as `Use with caution` verdicts requiring human review, because high MI alone is not proof that a feature is unavailable at prediction time. With `final_price_usd` still in the feature set (along with `units_sold`), RandomForestRegressor achieved R² = 1.000 trivially, since `revenue_usd = final_price_usd × units_sold` exactly. The reflector correctly raised a `needs_attention` warning with a suspicious near-perfect R² issue. This demonstrates both the strength of the leakage detector (caught the high-MI proxy and surfaced it) and the intentional design choice to prefer human review over silent feature removal for soft signals.
 
 ---
 
@@ -284,13 +290,18 @@ This project implements a functioning offline agentic data scientist that adapts
 12. **Per-class F1 analysis** flagging specific underperforming classes beyond macro-averaged metrics
 13. **Feature importance and per-class F1 visualisations** saved automatically for tree-based models and classification runs
 14. **Centralised configuration** (`config.py`) making all thresholds and hyperparameters visible and adjustable in one place
+15. **Algorithmic fairness audits** including sensitive attribute detection, exclusion, and demographic parity calculations
+16. **SMOTE integration** for dynamically handling severely imbalanced datasets
+17. **Low-dimensional polynomial feature engineering** for simple non-linear signal capture
+18. **Cost-aware compute estimation** to scale down tuning budgets for massive datasets
+19. **High-dimensional planning rules** that bias wide datasets toward simpler, more regularised search
 
-Future work would address the identified limitations: implementing progressive leakage threshold reduction during replanning; adding SMOTE for severe imbalance; implementing `use_feature_engineering`; and adding fairness-aware checks for protected characteristics.
+Future work would address the identified limitations, such as implementing progressive leakage threshold reduction during replanning and broadening feature engineering beyond the current low-dimensional quadratic expansion.
 
-The test suite achieves 91% code coverage (167 tests), well above the 60% requirement, with integration-level smoke tests that exercise the full pipeline end-to-end using real datasets.
+The test suite achieves 87% total code coverage (177 tests), well above the 60% requirement, with integration-level smoke tests that exercise the full pipeline end-to-end using real datasets.
 
-The most important lesson from this project is that the value of an agentic system lies not in any single technique but in the connections between components. Detecting scale mismatch is only useful if the planner acts on it; leakage detection is only useful if the preprocessor respects it; training warnings are only useful if the reflector surfaces them. Each signal–plan–action–reflection chain required careful wiring across multiple files, and maintaining a shared signal map (`AGENT_SIGNAL_MAP.md`) throughout development proved essential for tracking which signals were implemented end-to-end versus partially wired or dead. This documentation practice would be equally valuable in any production ML system where multiple engineers share responsibility for different pipeline stages.
+The most important lesson from this project is that the value of an agentic system lies not in any single technique but in the connections between components. Detecting scale mismatch is only useful if the planner acts on it; leakage detection is only useful if the preprocessor respects it; training warnings are only useful if the reflector surfaces them. Each signal–plan–action–reflection chain required careful wiring across multiple files, and maintaining a shared signal map (`AGENT_SIGNAL_MAP.md`) throughout development proved essential for tracking which signals were implemented end-to-end versus only partially wired.
 
 ---
 
-*AI assistance (Claude) was used during the development and documentation of this project, in accordance with module guidelines.*
+*AI assistance tools were used during the development and documentation of this project, in accordance with module guidelines.*

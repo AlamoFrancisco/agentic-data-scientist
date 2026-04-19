@@ -21,7 +21,6 @@ LARGE_DATASET_ROWS = 10_000   # above this: always include ensemble models
 # Planner scenario thresholds
 HIGH_DIMENSIONAL_MIN_COLS = 100       # wide datasets benefit from simpler, more regularised plans
 HIGH_DIMENSIONAL_COL_RATIO = 0.25     # also treat p/n-heavy datasets as high-dimensional
-PLANNER_TUNING_MAX_WORKLOAD = 750_000 # rows * cols budget above which tuning is skipped
 PLANNER_CV_MAX_WORKLOAD = 2_000_000   # rows * cols budget above which CV is skipped
 PLANNER_CV_MAX_COLS = 250             # very wide datasets skip CV to control compute
 

@@ -185,12 +185,17 @@ class AgenticDataScientist:
             "apply_target_encoding",
             "drop_near_constant_features",
             "drop_correlated_features",
+            "apply_feature_engineering",
         }
         if any(step in plan for step in preprocessing_flags):
             labels.append("robust preprocessing")
 
-        if "drop_leaky_features" in plan:
+        if "drop_leaky_features" in plan and "drop_sensitive_features" in plan:
+            labels.append("leak & bias handling")
+        elif "drop_leaky_features" in plan:
             labels.append("leak handling")
+        elif "drop_sensitive_features" in plan:
+            labels.append("bias handling")
 
         if "use_simple_models_only" in plan:
             labels.append("simple models")

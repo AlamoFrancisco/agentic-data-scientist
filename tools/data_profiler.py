@@ -182,7 +182,7 @@ def is_classification_target(series: pd.Series) -> bool:
     
     # Float columns are usually continuous — but if all values are whole numbers
     # and cardinality is low, they are likely class labels stored as floats
-    if series.dtype == "float64":
+    if pd.api.types.is_float_dtype(series):
         non_null = series.dropna()
         if len(non_null) > 0 and (non_null % 1 == 0).all() and non_null.nunique() <= 20:
             return True
@@ -211,8 +211,8 @@ def detect_near_constant(df: pd.DataFrame, threshold: float = NEAR_CONSTANT_THRE
     """
     near_const = []
     for col in df.columns:
-        top_freq = df[col].value_counts(normalize=True, dropna=False).iloc[0]
-        if top_freq >= threshold:
+        vc = df[col].value_counts(normalize=True, dropna=False)
+        if not vc.empty and vc.iloc[0] >= threshold:
             near_const.append(col)
     return near_const
 

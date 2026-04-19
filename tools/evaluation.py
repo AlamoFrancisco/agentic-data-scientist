@@ -89,12 +89,18 @@ def plot_predicted_vs_actual(y_test: Any, y_pred: Any, out_path: str, title: str
 
 def plot_feature_importance(pipeline: Any, out_path: str, title: str, top_n: int = 15) -> Optional[str]:
     """
-    Horizontal bar chart of the top-N feature importances from the best model.
+    Horizontal bar chart of the top-N feature importances (or coefficients) from the best model.
     Returns the saved path, or None if the model does not support feature_importances_.
     """
     try:
         model = pipeline.named_steps["model"]
-        importances = model.feature_importances_
+        if hasattr(model, "feature_importances_"):
+            importances = model.feature_importances_
+        elif hasattr(model, "coef_"):
+            coef = np.abs(model.coef_)
+            importances = coef.mean(axis=0) if coef.ndim > 1 else coef
+        else:
+            return None
     except (AttributeError, KeyError):
         return None
 
@@ -103,6 +109,8 @@ def plot_feature_importance(pipeline: Any, out_path: str, title: str, top_n: int
         raw_names = list(preprocessor.get_feature_names_out())
         # Strip transformer prefix: "cont__alcohol" → "alcohol", "cat__sex_Male" → "sex_Male"
         feature_names = [n.split("__", 1)[-1] for n in raw_names]
+        if len(feature_names) != len(importances):
+            feature_names = [f"f{i}" for i in range(len(importances))]
     except Exception:
         feature_names = [f"f{i}" for i in range(len(importances))]
 
@@ -606,6 +614,7 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classifi
         best_metrics["per_class_f1"] = per_class_f1
         
     # Ethics & Fairness: Calculate Demographic Parity proxy if sensitive cols exist
+    # Note: Fairness auditing is currently scoped to classification. Regression fairness is skipped.
     if dataset_profile and is_classification:
         sensitive_cols = dataset_profile.get("sensitive_cols", [])
         X_test = best.get("X_test")
@@ -617,14 +626,24 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classifi
                 df_fair = pd.DataFrame({"group": X_test[col], "pred": y_pred})
                 top_groups = df_fair["group"].value_counts().nlargest(5).index
                 df_top = df_fair[df_fair["group"].isin(top_groups)]
-                majority_pred = df_fair["pred"].mode()[0]
-                rates = df_top.groupby("group")["pred"].apply(lambda x: (x == majority_pred).mean()).to_dict()
+                
+                # Heuristic to find the "positive" or "event" class
+                pred_counts = df_fair["pred"].value_counts()
+                if len(pred_counts) == 2 and 1 in pred_counts.index:
+                    target_pred = 1
+                elif len(pred_counts) == 2 and True in pred_counts.index:
+                    target_pred = True
+                else:
+                    # Fallback to the minority predicted class
+                    target_pred = pred_counts.index[-1]
+                    
+                rates = df_top.groupby("group")["pred"].apply(lambda x: (x == target_pred).mean()).to_dict()
                 if rates:
                     max_rate = max(rates.values())
                     min_rate = min(rates.values())
                     demographic_parity_ratio = min_rate / max_rate if max_rate > 0 else 1.0
                     fairness[col] = {
-                        "majority_predicted_class": str(majority_pred),
+                        "evaluated_class": str(target_pred),
                         "demographic_parity_ratio": round(float(demographic_parity_ratio), 3),
                         "selection_rates": {str(k): round(float(v), 3) for k, v in rates.items()}
                     }
@@ -772,7 +791,7 @@ def write_markdown_report(
         fairness_section += "## Fairness Audit (Demographic Parity)\n\n"
         for col, metrics in fairness_metrics.items():
             fairness_section += f"**Attribute:** `{col}`\n"
-            fairness_section += f"- **Target Class Evaluated:** `{metrics['majority_predicted_class']}`\n"
+            fairness_section += f"- **Target Class Evaluated:** `{metrics['evaluated_class']}`\n"
             fairness_section += f"- **Demographic Parity Ratio:** `{metrics['demographic_parity_ratio']}` (Ideal ≈ 1.0)\n"
             fairness_section += "- **Selection Rates by Group:**\n"
             for group, rate in metrics['selection_rates'].items():

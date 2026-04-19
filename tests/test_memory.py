@@ -170,7 +170,7 @@ def test_get_similar_record_returns_match_above_threshold(tmp_path):
     profile = {"shape": {"rows": 500}, "imbalance_ratio": 1.0, "missing_pct": {}}
     m.data["datasets"]["fp1"] = {
         "shape": {"rows": 700}, "imbalance_ratio": 1.0, "missing_pct": {},
-        "best_model": "RF",
+        "best_model": "RF", "verdict_label": "Reliable result",
     }
     result = m.get_similar_record(profile, threshold=0.5)
     assert result is not None
@@ -183,6 +183,7 @@ def test_get_similar_record_returns_none_below_threshold(tmp_path):
     # Very different record — different size bucket AND different imbalance
     m.data["datasets"]["fp1"] = {
         "shape": {"rows": 50000}, "imbalance_ratio": 5.0, "missing_pct": {},
+        "verdict_label": "Reliable result",
     }
     result = m.get_similar_record(profile, threshold=0.9)
     assert result is None

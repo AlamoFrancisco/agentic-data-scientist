@@ -11,10 +11,10 @@
 
 An **Offline Agentic Data Scientist** — an autonomous agent that performs end-to-end data science tasks (classification and regression) without relying on Large Language Models.
 
-The agent uses **rule-based reasoning, heuristics, and meta-learning** to autonomously:
+The agent uses **rule-based reasoning, heuristics, and persistent memory** to autonomously:
 - Profile datasets (scale, leakage, imbalance, missing data, near-constant features)
 - Plan execution workflows adapted to dataset characteristics
-- Train and evaluate models (Logistic Regression, Random Forest, Gradient Boosting, SVC, Dummy)
+- Train and evaluate classification and regression models (Dummy, Linear/Logistic, Ridge, Random Forest, Gradient Boosting, HistGradientBoosting, SVC)
 - Reflect on results and trigger targeted replanning
 - Learn from experience across runs via persistent memory
 
@@ -24,19 +24,19 @@ The agent uses **rule-based reasoning, heuristics, and meta-learning** to autono
 
 ```bash
 # Set up environment
-python -m venv venv
+python3 -m venv venv
 source venv/bin/activate       # macOS/Linux
 # venv\Scripts\activate        # Windows
 
 pip install -r requirements.txt
 
 # Run on a dataset
-python run_agent.py --data data/penguins.csv --target species
-python run_agent.py --data data/titanic.csv --target survived
-python run_agent.py --data data/Sales.csv --target revenue_usd
+python3 run_agent.py --data data/penguins.csv --target species
+python3 run_agent.py --data data/titanic.csv --target survived
+python3 run_agent.py --data data/Sales.csv --target revenue_usd
 
 # Auto-detect target column
-python run_agent.py --data data/penguins.csv --target auto
+python3 run_agent.py --data data/penguins.csv --target auto
 ```
 
 Outputs are written to `outputs/[timestamp]/`.
@@ -101,13 +101,19 @@ Dataset-adaptive planning based on profiler signals:
 | Signal | Plan step |
 |--------|-----------|
 | rows < 1000 | `apply_regularization` + `use_simple_models_only` |
-| rows ≥ 10,000 | `use_ensemble_models` |
+| high-dimensional data (`feature_cols >= 100` or `feature_cols / rows >= 0.25`) | `apply_regularization` + `use_simple_models_only` |
+| rows ≥ 10,000 and not high-dimensional | `use_ensemble_models` |
+| feature_cols ≤ 15 | `apply_feature_engineering` |
 | scale mismatch (max/median range ≥ 50) | `apply_robust_scaling` |
-| MI leakage ≥ 0.9 | `drop_leaky_features` |
+| hard leakage evidence | `drop_leaky_features` |
 | high-cardinality categoricals (n_unique > 50) | `apply_target_encoding` |
 | correlated features (abs_corr ≥ 0.95) | `drop_correlated_features` |
 | near-constant columns (≥ 95% dominant value) | `drop_near_constant_features` |
-| imbalance ratio ≥ 3.0 | `consider_imbalance_strategy` |
+| imbalance ratio ≥ 5.0 | `apply_oversampling` |
+| imbalance ratio ≥ 3.0 and < 5.0 | `consider_imbalance_strategy` |
+| sensitive columns detected | `drop_sensitive_features` |
+| large tuning workload (`rows * cols` high) | `reduce_tuning_budget` |
+| extreme workload (`rows * cols` very high or feature space very wide) | skip `validate_with_cross_validation` |
 | memory hint (prior best model) | `prioritize_model:<name>` |
 
 ### 2. Reflector (`agents/reflector.py`)
@@ -138,7 +144,10 @@ Extended profiling signals:
 
 ### 6. Modelling (`tools/modelling.py`)
 - `TargetEncoder` (sklearn ≥ 1.3) for high-cardinality categoricals — fitted inside Pipeline to prevent leakage
+- `PolynomialFeatures(degree=2)` for low-dimensional continuous feature engineering
 - `RobustScaler` for outlier handling
+- `SMOTE` oversampling for severe class imbalance (via `imbalanced-learn`)
+- Reduced tuning budget for large workloads
 - Size-bucket model selection (small/medium/large)
 - Runtime warnings captured and surfaced to Reflector
 
@@ -149,13 +158,13 @@ Extended profiling signals:
 ### Basic Usage
 
 ```bash
-python run_agent.py --data data/penguins.csv --target species
+python3 run_agent.py --data data/penguins.csv --target species
 ```
 
 ### All Arguments
 
 ```bash
-python run_agent.py \
+python3 run_agent.py \
     --data data/your_dataset.csv \
     --target target_column_name \
     --output_root outputs \
@@ -199,7 +208,7 @@ See [data/README.md](data/README.md) for full documentation of all datasets and 
 | `penguins.csv` | 344 | Classification | `apply_regularization`, `apply_robust_scaling` |
 | `titanic.csv` | 891 | Classification | `drop_leaky_features` (`alive` col), `handle_outliers` |
 | `digits.csv` | 1797 | Classification | `drop_near_constant_features` (14 border pixels) |
-| `Sales.csv` | 30000 | Regression | `apply_target_encoding`, `drop_leaky_features`, `use_ensemble_models` |
+| `Sales.csv` | 30000 | Regression | `apply_target_encoding`, `drop_sensitive_features`, `reduce_tuning_budget`, soft leakage warning |
 | `WineQuality.csv` | 1700 | Regression | Baseline regression pipeline |
 
 ---
@@ -208,13 +217,13 @@ See [data/README.md](data/README.md) for full documentation of all datasets and 
 
 ```bash
 # Run all tests
-pytest tests/
+python3 -m pytest tests/
 
 # With coverage report
-pytest --cov=agents --cov=tools --cov=agentic_data_scientist --cov-report=term-missing tests/
+python3 -m pytest --cov=agents --cov=tools --cov=agentic_data_scientist --cov-report=term tests/
 ```
 
-Current coverage: **93%** (126 tests, 0 failing)
+Current coverage: **87%** total (177 tests, 0 failing).
 
 ---
 
@@ -222,19 +231,19 @@ Current coverage: **93%** (126 tests, 0 failing)
 
 - [x] All code runs without errors
 - [x] README.md updated with actual implementation details
-- [x] requirements.txt includes all dependencies (`scikit-learn>=1.3.0`)
+- [x] requirements.txt includes all dependencies (`scikit-learn>=1.3.0`, `imbalanced-learn`)
 - [x] 5 datasets documented in `data/README.md` (4 evaluation + 1 smoke test)
-- [x] Technical report completed — `report/REPORT.md` (3019 words)
-- [x] Test coverage > 60% (93% achieved)
+- [x] Technical report completed — `report/REPORT.md` (~4,000 words)
+- [x] Test coverage > 60% (87% achieved)
 - [x] All core components extended significantly
 - [x] At least 3 advanced features implemented
-- [x] Repository is clean and organised
+- [x] Repository is organised for submission
 
 ---
 
 ## Academic Integrity
 
-This is individual work. AI assistance was used and is disclosed in the technical report (Section 9).
+This is individual work. AI assistance was used and is disclosed in the technical report.
 
 ---
 

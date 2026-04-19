@@ -64,7 +64,10 @@ def _compare_models_statistically(
         return None
 
     try:
-        t_stat, p_value = ttest_rel(scores_a, scores_b)
+        if scores_a == scores_b:
+            t_stat, p_value = 0.0, 1.0
+        else:
+            t_stat, p_value = ttest_rel(scores_a, scores_b)
     except Exception:
         return None
 
@@ -108,6 +111,26 @@ def _prioritize_suggestions(suggestions: List[str]) -> List[str]:
         return 2
 
     return sorted(suggestions, key=_priority)
+
+
+def _format_leakage_evidence(leakage_list: List[Dict[str, Any]], is_soft: bool = False) -> str:
+    """Helper to format a list of leakage dictionaries into a readable string."""
+    evidence = []
+    for item in leakage_list[:5]:
+        if not item.get("column"):
+            continue
+        if is_soft:
+            norm_mi = item.get("normalised_mi")
+            evidence.append(f"`{item['column']}` (normalised MI {float(norm_mi):.2f})" if norm_mi is not None else f"`{item['column']}`")
+        else:
+            reason = item.get("reason")
+            if reason == "exact_target_copy":
+                evidence.append(f"`{item['column']}` (exact target copy)")
+            elif reason == "deterministic_target_mapping":
+                evidence.append(f"`{item['column']}` (deterministic target mapping)")
+            else:
+                evidence.append(f"`{item['column']}`")
+    return ", ".join(evidence)
 
 
 def reflect(
@@ -154,18 +177,7 @@ def reflect(
     sensitive_cols = dataset_profile.get("sensitive_cols", [])
 
     if hard_leakage and not dataset_profile.get("drop_leaky"):
-        evidence = []
-        for item in hard_leakage[:5]:
-            if not item.get("column"):
-                continue
-            reason = item.get("reason")
-            if reason == "exact_target_copy":
-                evidence.append(f"`{item['column']}` (exact target copy)")
-            elif reason == "deterministic_target_mapping":
-                evidence.append(f"`{item['column']}` (deterministic target mapping)")
-            else:
-                evidence.append(f"`{item['column']}`")
-        flagged = ", ".join(evidence)
+        flagged = _format_leakage_evidence(hard_leakage)
         issues.append(f"Profiler found hard target-leakage evidence in: {flagged}.")
         suggestions.append(
             "Human review required before trusting this run. Remove the flagged columns "
@@ -173,33 +185,13 @@ def reflect(
         )
         review_required = True
     elif hard_leakage and dataset_profile.get("drop_leaky"):
-        evidence = []
-        for item in hard_leakage[:5]:
-            if not item.get("column"):
-                continue
-            reason = item.get("reason")
-            if reason == "exact_target_copy":
-                evidence.append(f"`{item['column']}` (exact target copy)")
-            elif reason == "deterministic_target_mapping":
-                evidence.append(f"`{item['column']}` (deterministic target mapping)")
-            else:
-                evidence.append(f"`{item['column']}`")
-        flagged = ", ".join(evidence)
+        flagged = _format_leakage_evidence(hard_leakage)
         suggestions.append(
             f"Hard-leakage columns ({flagged}) were detected and dropped before training. "
             "Verify the remaining features are genuinely predictive."
         )
     if soft_leakage and not dataset_profile.get("drop_leaky"):
-        evidence = []
-        for item in soft_leakage[:5]:
-            if not item.get("column"):
-                continue
-            norm_mi = item.get("normalised_mi")
-            if norm_mi is not None:
-                evidence.append(f"`{item['column']}` (normalised MI {float(norm_mi):.2f})")
-            else:
-                evidence.append(f"`{item['column']}`")
-        flagged = ", ".join(evidence)
+        flagged = _format_leakage_evidence(soft_leakage, is_soft=True)
         issues.append(f"Profiler flagged soft target-proxy risk in: {flagged}.")
         suggestions.append(
             "Human review recommended before trusting this result. "

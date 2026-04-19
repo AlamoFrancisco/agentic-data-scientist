@@ -18,20 +18,21 @@ All fields that `profile_dataset()` currently returns.
 | `missing_pct` | dict | % missing per column |
 | `outlier_cols` | list | Columns with >5% IQR outliers |
 | `near_constant_cols` | list | Columns where one value dominates (≥95%) |
-| `high_corr_pairs` | list | Strongly correlated feature pairs (abs_corr ≥ 0.6) |
-| `high_corr_present` | bool | Any pair with abs_corr ≥ 0.6 |
+| `high_corr_pairs` | list | Strongly correlated feature pairs (abs_corr ≥ 0.8) |
+| `high_corr_present` | bool | Any pair with abs_corr ≥ 0.8 |
 | `max_abs_corr` | float | Highest pairwise correlation |
-| `corr_cols_to_drop` | list | Columns to drop (weaker of each highly correlated pair, abs_corr ≥ 0.95) |
 | `scale_mismatch` | bool | True when max_range / median_range ≥ 50 across numeric cols |
 | `scale_range_ratio` | float | max_range / median_range across numeric cols |
-| `leaky_cols` | list | Column indices with normalised MI ≥ 0.9 with target |
-| `leaky_col_names` | list | Column names with normalised MI ≥ 0.9 with target |
+| `leaky_cols` | list | Leakage evidence dicts returned by `leakage_report()` |
+| `hard_leakage_cols` | list | Leakage signals treated as hard evidence |
+| `soft_leakage_cols` | list | Leakage signals treated as proxy suspicion |
 | `feature_types.text` | list | Text columns (not encoded) |
 | `feature_types.categorical.binary` | list | Binary categorical columns |
 | `feature_types.categorical.multiclass` | list | Multi-value categorical columns |
 | `feature_types.numeric.continuous` | list | Continuous numeric columns |
 | `feature_types.numeric.ordinal` | list | Integer-like low-cardinality columns |
 | `n_unique_by_col` | dict | Unique value count per column |
+| `sensitive_cols` | list | Columns whose names suggest protected / sensitive attributes |
 | `duplicate_count` | int | Duplicate rows (already dropped before profiling) |
 | `is_classification` | bool | Classification (True) vs regression (False) |
 | `notes` | list | Human-readable warnings generated during profiling |
@@ -44,27 +45,33 @@ All fields that `profile_dataset()` currently returns.
 ## 2. Planner Signal → Plan Step Mapping
 
 ### Implemented
-| Profile signal | Condition | Plan step added |
-|----------------|-----------|-----------------|
-| `imbalance_ratio` | ≥ 3.0 | `consider_imbalance_strategy` |
-| `shape.rows` | < 1000 | `apply_regularization` + `use_simple_models_only` |
-| `shape.rows` | ≥ 10,000 | `use_ensemble_models` |
-| `missing_pct` max | > 20% | `handle_severe_missing_data` |
+| Profile signal | Condition | Plan step added / changed |
+|----------------|-----------|---------------------------|
+| `imbalance_ratio` | `>= 5.0` | `apply_oversampling` |
+| `imbalance_ratio` | `>= 3.0` and `< 5.0` | `consider_imbalance_strategy` |
+| `shape.rows` | `< 1000` | `apply_regularization` + `use_simple_models_only` |
+| `shape.rows` + `shape.cols` | high-dimensional (`feature_cols >= 100` or `feature_cols / rows >= 0.25`) | `apply_regularization` + `use_simple_models_only` |
+| `shape.rows` | `>= 10,000` and not high-dimensional | `use_ensemble_models` |
+| `missing_pct` max | `> 20%` | `handle_severe_missing_data` |
 | `outlier_cols` | not empty | `handle_outliers` |
-| `scale_mismatch` | True | `apply_robust_scaling` |
-| `high_corr_pairs` | any pair abs_corr ≥ 0.95 | `drop_correlated_features` |
-| `leaky_cols` | not empty | `drop_leaky_features` |
-| `feature_types.categorical.multiclass` | n_unique > 50 | `apply_target_encoding` |
+| `shape.cols` | `feature_cols <= 15` | `apply_feature_engineering` |
+| `scale_mismatch` | `True` | `apply_robust_scaling` |
+| `high_corr_pairs` | any pair `abs_corr >= 0.95` | `drop_correlated_features` |
+| `hard_leakage_cols` | not empty | `drop_leaky_features` |
+| `near_constant_cols` | not empty | `drop_near_constant_features` |
+| `sensitive_cols` | not empty | `drop_sensitive_features` |
+| `feature_types.categorical.multiclass` / `feature_types.text` | high-cardinality values detected | `apply_target_encoding` |
 | `memory_hint.best_model` | present | `prioritize_model:<name>` |
+| `shape.rows` + workload | medium/large and not high-dimensional | `tune_hyperparameters` |
+| workload (`rows * cols`) | `> COMPUTE_COST_THRESHOLD` | `reduce_tuning_budget` inserted before tuning |
+| extreme workload | `rows * cols > PLANNER_CV_MAX_WORKLOAD` or `feature_cols >= PLANNER_CV_MAX_COLS` | `validate_with_cross_validation` removed |
 
-| `near_constant_cols` | not empty | `drop_near_constant_features` | Preprocessor already drops them unconditionally; plan step adds visibility in log/report |
-
-### Not yet implemented
+### Still not implemented
 | Profile signal | Condition | Plan step to add | Why |
-| `feature_types.text` | not empty | `encode_text_features` | Text silently ignored right now |
-| `shape.cols` | > 100 | `apply_dimensionality_reduction` | High-dim → overfitting risk |
-| `skewness` (not in profiler) | > 1.5 on any continuous col | `apply_log_transform` | Skew hurts linear/distance models |
-| `imbalance_ratio` | ≥ 10.0 | `apply_oversampling` | Severe imbalance → class weights alone insufficient |
+|----------------|-----------|------------------|-----|
+| `feature_types.text` | free-form text genuinely present | `encode_text_features` | Only categorical-like text is currently handled |
+| `feature_types.datetime` | not empty | `time_aware_validation` / `temporal_features` | No time-series-specific planning yet |
+| `skewness` (not in profiler) | `> 1.5` on any continuous column | `apply_log_transform` | Skew-aware preprocessing is still absent |
 
 ---
 
@@ -73,20 +80,24 @@ All fields that `profile_dataset()` currently returns.
 The executor (`agentic_data_scientist.py` main loop) reads plan steps and sets flags on the profile dict. Those flags are then consumed by `build_preprocessor()` and `select_models()`.
 
 | Plan step | Profile flag set | Downstream effect | Status |
-|-----------|-----------------|-------------------|--------|
-| `consider_imbalance_strategy` | `use_class_weights = True` | Redundant — `select_models` reads `imbalance_ratio` directly | Works (flag unused) |
+|-----------|------------------|-------------------|--------|
+| `consider_imbalance_strategy` | `use_class_weights = True` | `select_models()` prefers explicit class weights, with `imbalance_ratio` as fallback | Yes |
+| `apply_oversampling` | `apply_oversampling = True` | `train_models()` enables SMOTE when `imbalanced-learn` is installed | Yes |
 | `apply_regularization` | `use_regularization = True` | `LogisticRegression(C=0.1, solver=saga)` | Yes |
-| `handle_severe_missing_data` | `robust_imputation = True` | Dead flag — imputer always uses `median` | Dead flag |
+| `handle_severe_missing_data` | `robust_imputation = True` | Adds indicator-aware numeric imputation and `__missing__` categorical fills | Yes |
 | `apply_target_encoding` | `use_target_encoding = True` | `TargetEncoder` branch added to `ColumnTransformer` for high-cardinality cols (n_unique ≥ 50) | Yes |
-| `apply_feature_engineering` | `use_feature_engineering = True` | Dead flag — feature engineering not implemented | Dead flag |
+| `apply_feature_engineering` | `use_feature_engineering = True` | `build_preprocessor()` appends `PolynomialFeatures(degree=2, include_bias=False)` to the continuous pipeline | Yes |
 | `handle_outliers` | `handle_outliers = True` | `RobustScaler` (small) or `RobustScaler(unit_variance=True)` (≥1000 rows) | Yes |
 | `apply_robust_scaling` | `use_robust_scaling = True` | `RobustScaler` instead of `StandardScaler` | Yes |
 | `drop_correlated_features` | `drop_high_corr = True` | Drops `corr_cols_to_drop` in `build_preprocessor()` | Yes |
 | `drop_leaky_features` | `drop_leaky = True` | Drops `leaky_col_names` in `build_preprocessor()` | Yes |
+| `drop_sensitive_features` | `drop_sensitive = True` | Drops `sensitive_cols` in `build_preprocessor()` | Yes |
 | `use_simple_models_only` | `simple_models_only = True` | Only `Dummy + LR + RF` — no GradientBoosting or SVC | Yes |
-| `use_ensemble_models` | `prefer_ensemble = True` | Always includes `GradientBoosting` | Yes |
+| `use_ensemble_models` | `prefer_ensemble = True` | Includes GradientBoosting / HistGradientBoosting in candidate set | Yes |
 | `drop_near_constant_features` | logs columns | Preprocessor already drops `near_constant_cols` unconditionally — step adds plan visibility | Yes |
-| `apply_log_transform` | `use_log_transform = True` | Not wired up yet | Not implemented |
+| `reduce_tuning_budget` | `reduce_tuning_budget = True` | `tune_best_model()` reduces search iterations and may sub-sample rows | Yes |
+| `tune_hyperparameters` | — | Orchestrator calls `tune_best_model()` on the best candidate | Yes |
+| `validate_with_cross_validation` | — | Orchestrator runs `cross_validate_top_models()` on top candidates | Yes |
 
 ---
 
@@ -95,25 +106,27 @@ The executor (`agentic_data_scientist.py` main loop) reads plan steps and sets f
 ### Implemented
 | Signal | Issue raised | Suggestion | Triggers replan? |
 |--------|-------------|------------|-----------------|
-| Best model barely beats dummy (< 0.05 improvement) | "Weak signal or pipeline issues" | Check leakage / verify target quality | Yes (if f1 < 0.60) |
-| `bal_acc > 0.90` and `f1_macro < 0.70` | "Overfitting suspected" | Regularization / reduce complexity | Yes (if f1 < 0.60) |
-| `f1_macro < 0.60` | "Modest F1 score" | Try different models / tune hyperparameters | Yes |
+| Hard leakage evidence in profiler | "Profiler found hard target-leakage evidence..." | Remove flagged columns / confirm they are unavailable at prediction time | No automatic replan; forces review |
+| Soft leakage evidence in profiler | "Profiler flagged soft target-proxy risk..." | Human review before trusting the run | No automatic replan; forces review |
+| Best model barely beats dummy (< 0.05 improvement) | "Weak signal or pipeline issues" | Check leakage / verify target quality | Yes (if macro F1 is also below the active threshold) |
+| `bal_acc > 0.90` and `f1_macro < 0.70` | "Overfitting suspected" | Regularization / reduce complexity | Yes (if macro F1 is also below the active threshold) |
+| `f1_macro` below adaptive threshold | "Macro F1 below expected threshold" | Try different models / tuning / preprocessing | Yes |
+| Per-class F1 breakdown | "Class X has very low F1" | Investigate class overlap / weights / sample coverage | Yes |
 | ≥2 non-dummy models near-perfect (bal_acc ≥ 0.99, f1 ≥ 0.99) | "Suspicious near-perfect performance" | Check for target proxies / leakage | No (f1 too high) |
-| All models F1 within 0.05 | "Low model diversity" | Try more diverse models | Yes (if f1 < 0.60) |
-| `imbalance_ratio ≥ 3.0` | — | Consider class_weight / threshold tuning / SMOTE | No (suggestion only) |
+| All models F1 within 0.05 | "Low model diversity" | Try more diverse models | Yes (if macro F1 is also below the active threshold) |
+| `imbalance_ratio ≥ 3.0` | — | Consider class_weight / threshold tuning | No (suggestion only) |
+| `imbalance_ratio ≥ 5.0` + weak baseline margin | "Severe class imbalance..." | Consider class_weight / threshold tuning / oversampling | Yes |
+| Sensitive columns detected | — | Run a fairness audit / inspect disparate impact | No |
 | Regression: R² barely beats dummy (< 0.05 improvement) | "Weak regression signal" | Check feature engineering / target quality | Yes |
 | Regression: `r2 < 0.1` | "R² very low" | Try feature engineering / verify target is predictable | Yes |
 | Regression: ≥2 non-dummy models with R² ≥ 0.99 | "Suspicious near-perfect R²" | Inspect features for target proxies or multiplicative combinations | Yes |
+| `training_warnings` contains overflow/divide-by-zero | Suggestion always; escalates to issue if performance is also weak | Apply robust scaling / check extreme feature values | Only if weak performance too |
 
-| `training_warnings` contains overflow/divide-by-zero | Suggestion always; escalates to issue if f1 < 0.60 (classification) or r2 < 0.1 (regression) | Apply robust scaling / check extreme feature values | Only if weak performance too |
-
-### Not yet implemented
+### Still not implemented
 | Signal | Issue to raise | Suggestion |
 |--------|---------------|------------|
-| Per-class F1 breakdown | "Class X has low recall" | Investigate minority class / threshold tuning |
-| `imbalance_ratio ≥ 10` | "Severe imbalance" | Try SMOTE or oversampling, not just class weights |
-| `outlier_cols` present + bad R² | "Outliers may be distorting regression" | Use robust scaling |
-| Replan count > 1, no improvement | "Replanning not helping" | Stop early |
+| `outlier_cols` present + bad R² | "Outliers may be distorting regression" | Use robust scaling / robust models |
+| Replan count > 1, no improvement | "Replanning not helping" | Stop early / escalate to human review |
 
 ---
 
@@ -132,8 +145,10 @@ This prevents spurious replans when near-perfect performance raises a leakage wa
 |---------------|----------------|
 | `"overfitting"` | `apply_regularization` |
 | `"imbalance"` | `consider_imbalance_strategy` |
-| `"f1"` (case-insensitive) | `try_ensemble_methods` (⚠️ ignored by executor) |
-| `"baseline"` | `apply_feature_engineering` |
+| `"f1"` (case-insensitive) | `use_ensemble_models` |
+| `"baseline"` | `use_ensemble_models` |
+| `"instability"` / `"scaling"` | `apply_robust_scaling` |
+| `"cross-validation mean"` | `apply_regularization` + `increase_test_size = True` |
 
 ---
 
@@ -147,7 +162,7 @@ Runtime warnings from sklearn are captured during `train_models()` and stored in
 | Scope | Unique warning strings across all trained models per run |
 | Console | Suppressed — won't clutter output |
 
-> **Future:** Reflector could inspect `training_warnings` and raise an issue if overflow/divide-by-zero warnings appear (suggests feature scale problems).
+> **Current behavior:** Reflector already inspects `training_warnings` and adds a scaling-related suggestion. It escalates them to an issue when weak performance suggests the warnings are actually harming the run.
 
 ---
 
@@ -208,9 +223,9 @@ Threshold: ≥ 0.5 (≥ 2 of 3 checks). Returns best match above threshold.
 
 | Bucket | Rows | Models included |
 |--------|------|----------------|
-| Small | < 1000 | Dummy + LR + RF + GradientBoosting + SVC (if cols ≤ 50) — overridden to Dummy + LR + RF when `simple_models_only=True` |
-| Medium | 1000–9999 | Dummy + LR + RF + GradientBoosting |
-| Large | ≥ 10000 | Dummy + LR + RF + GradientBoosting (via `prefer_ensemble`) |
+| Small | < 1000 | Default list can include Dummy + LR + RF + SVC, but planner usually overrides to `simple_models_only=True` |
+| Medium | 1000–9999 | Dummy + LR + RF + GradientBoosting + HistGradientBoosting |
+| Large | ≥ 10000 | Dummy + LR + RF + GradientBoosting + HistGradientBoosting when `prefer_ensemble=True` |
 
 **SVC:** `probability=False` (Platt scaling removed — unused in pipeline). Only added for small datasets with ≤ 50 raw columns. Currently unreachable because planner always sets `simple_models_only` for rows < 1000.
 
@@ -220,15 +235,16 @@ Threshold: ≥ 0.5 (≥ 2 of 3 checks). Returns best match above threshold.
 
 | Issue | Location | Severity | Status |
 |-------|----------|----------|--------|
-| `robust_imputation` flag set but unused | executor | Medium | `build_preprocessor` always uses `SimpleImputer(median)` regardless |
+| ~~`robust_imputation` flag set but unused~~ | executor | Fixed | `build_preprocessor()` now switches imputation strategy and adds missing indicators when requested |
 | ~~`use_target_encoding` flag set but unused~~ | executor | Fixed | `TargetEncoder` branch wired into `build_preprocessor()` for high-cardinality cols |
-| `use_feature_engineering` flag set but unused | executor | Medium | Feature engineering not implemented |
-| `try_ensemble_methods` added by replan but ignored | reflector/executor | Medium | No executor handler — silently skipped |
+| ~~`use_feature_engineering` flag set but unused~~ | executor/modelling | Fixed | `build_preprocessor()` now injects `PolynomialFeatures(degree=2, include_bias=False)` when requested |
 | `replan_attempt` marker added by replan | reflector | Low | Harmless but clutters plan output |
-| `use_class_weights` flag redundant | executor | Low | `select_models` reads `imbalance_ratio` directly — flag not needed |
+| `use_class_weights` flag partly redundant | executor | Low | `select_models()` honours the flag, but can also infer the same behaviour from `imbalance_ratio` |
 | ~~Spurious replan on near-perfect datasets~~ | reflector | Fixed | `should_replan()` now only returns `True` when `replan_recommended=True` |
 | ~~Leakage detection broken for regression~~ | profiler | Fixed | Regression target was factorized before MI — now uses raw values, normalised by max MI |
 | ~~Training warnings not acted on~~ | reflector | Fixed | Overflow/divide warnings now raise suggestion (and issue if performance is also weak) |
+| ~~`apply_oversampling` advertised but not wired~~ | planner/executor/modelling | Fixed | Severe imbalance now routes to SMOTE-compatible training when available |
+| ~~`drop_sensitive_features` advertised but not wired~~ | planner/executor/modelling | Fixed | Sensitive attributes can now be removed before preprocessing |
 | SVC unreachable | modelling | Low | Planner always sets `simple_models_only` for rows < 1000, which returns before SVC is added |
 
 ---
@@ -238,6 +254,6 @@ Threshold: ≥ 0.5 (≥ 2 of 3 checks). Returns best match above threshold.
 | Priority | What | Why |
 |----------|------|-----|
 | 1 | Tests (>60% coverage required) | Assignment hard requirement — nothing else ships without this |
-| 2 | Fix dead flag: `robust_imputation` | Advertised in plan but `build_preprocessor` ignores it |
-| 3 | Fix dead flag: `use_feature_engineering` | Advertised in plan but not implemented |
-| 4 | Report (3000–4000 words) | Assignment requirement — do last |
+| 2 | README / report / signal-map sync | Submission-facing documentation should match the implemented planner and test counts |
+| 3 | Revisit SVC reachability | Small-dataset planning currently makes the SVC branch effectively unreachable |
+| 4 | Expand feature engineering breadth | Current implementation is limited to low-dimensional numeric polynomial expansion |

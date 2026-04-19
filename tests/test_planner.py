@@ -167,3 +167,32 @@ def test_soft_leakage_does_not_auto_drop_features():
     plan = create_plan(profile)
     assert "drop_leaky_features" not in plan
     assert "leaky_col_names" not in profile
+
+
+def test_high_dimensional_dataset_prefers_regularized_simple_models():
+    profile = make_profile(shape={"rows": 5_000, "cols": 150})
+    plan = create_plan(profile)
+    assert "apply_regularization" in plan
+    assert "use_simple_models_only" in plan
+    assert "tune_hyperparameters" not in plan
+
+
+def test_high_dimensional_large_dataset_does_not_force_ensemble_models():
+    profile = make_profile(shape={"rows": 15_000, "cols": 150})
+    plan = create_plan(profile)
+    assert "use_simple_models_only" in plan
+    assert "use_ensemble_models" not in plan
+
+
+def test_cost_aware_planning_reduces_tuning_budget_on_large_workload():
+    profile = make_profile(shape={"rows": 30_000, "cols": 20})
+    plan = create_plan(profile)
+    assert "tune_hyperparameters" in plan
+    assert "reduce_tuning_budget" in plan
+    assert profile["reduce_tuning_budget"] is True
+
+
+def test_extreme_workload_skips_cross_validation():
+    profile = make_profile(shape={"rows": 30_000, "cols": 100})
+    plan = create_plan(profile)
+    assert "validate_with_cross_validation" not in plan
