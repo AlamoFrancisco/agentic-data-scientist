@@ -35,6 +35,8 @@ import pandas as pd
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from sklearn.inspection import permutation_importance
+from sklearn.preprocessing import FunctionTransformer
 from sklearn.metrics import confusion_matrix, classification_report
 from sklearn.utils.multiclass import unique_labels
 
@@ -131,8 +133,98 @@ def plot_predicted_vs_actual(y_test: Any, y_pred: Any, out_path: str, title: str
     plt.close()
 
 
-def _feature_importance_data(pipeline: Any) -> Optional[tuple[np.ndarray, List[str]]]:
-    """Return model importance values and aligned feature names when available."""
+def _normalise_feature_names(feature_names: Any) -> List[str]:
+    if feature_names is None:
+        return []
+    if isinstance(feature_names, (pd.Index, np.ndarray, list, tuple)):
+        return [str(name) for name in list(feature_names)]
+    return [str(feature_names)]
+
+
+def _resolve_transformer_input_names(columns: Any, all_input_names: List[str]) -> List[str]:
+    if columns is None:
+        return []
+    if isinstance(columns, slice):
+        return all_input_names[columns]
+    if isinstance(columns, (str, np.str_)):
+        return [str(columns)]
+    if isinstance(columns, (int, np.integer)):
+        return [all_input_names[int(columns)]]
+    if isinstance(columns, (list, tuple, np.ndarray, pd.Index)):
+        values = list(columns)
+        if not values:
+            return []
+        first = values[0]
+        if isinstance(first, (bool, np.bool_)):
+            return [name for name, keep in zip(all_input_names, values) if keep]
+        if isinstance(first, (int, np.integer)):
+            return [all_input_names[int(idx)] for idx in values]
+        return [str(value) for value in values]
+    return []
+
+
+def _call_feature_names_out(transformer: Any, input_names: List[str]) -> Optional[List[str]]:
+    if transformer in ("drop", None):
+        return []
+    if transformer == "passthrough":
+        return input_names
+
+    if hasattr(transformer, "steps"):
+        current_names = input_names
+        for _, step in transformer.steps:
+            if step in ("drop", None):
+                return []
+            if step == "passthrough" or isinstance(step, FunctionTransformer):
+                continue
+            if hasattr(step, "get_feature_names_out"):
+                try:
+                    current_names = _normalise_feature_names(step.get_feature_names_out(current_names))
+                    continue
+                except Exception:
+                    try:
+                        current_names = _normalise_feature_names(step.get_feature_names_out())
+                        continue
+                    except Exception:
+                        pass
+            # Conservative fallback for one-to-one transformers that do not publish names.
+            # A later length check will reject mismatches for expanding transforms.
+        return current_names
+
+    if hasattr(transformer, "get_feature_names_out"):
+        try:
+            return _normalise_feature_names(transformer.get_feature_names_out(input_names))
+        except Exception:
+            try:
+                return _normalise_feature_names(transformer.get_feature_names_out())
+            except Exception:
+                return None
+
+    return input_names
+
+
+def _recover_feature_names_from_preprocessor(preprocessor: Any) -> Optional[List[str]]:
+    """Best-effort feature-name recovery when get_feature_names_out() fails."""
+    all_input_names = _normalise_feature_names(getattr(preprocessor, "feature_names_in_", None))
+    if not hasattr(preprocessor, "transformers_"):
+        return None
+
+    recovered_names: List[str] = []
+    for name, transformer, columns in getattr(preprocessor, "transformers_", []):
+        if name == "remainder" and transformer == "drop":
+            continue
+
+        input_names = _resolve_transformer_input_names(columns, all_input_names)
+        branch_names = _call_feature_names_out(transformer, input_names)
+        if branch_names is None:
+            return None
+
+        recovered_names.extend([branch.split("__", 1)[-1] for branch in branch_names])
+
+    return recovered_names or None
+
+
+def _native_feature_importance_data(pipeline: Any) -> Optional[tuple[np.ndarray, List[str]]]:
+    """Return native model importances or coefficients when available."""
     try:
         model = pipeline.named_steps["model"]
         if hasattr(model, "feature_importances_"):
@@ -147,10 +239,13 @@ def _feature_importance_data(pipeline: Any) -> Optional[tuple[np.ndarray, List[s
 
     try:
         preprocessor = pipeline.named_steps["preprocess"]
-        raw_names = list(preprocessor.get_feature_names_out())
-        # Strip transformer prefix: "cont__alcohol" → "alcohol", "cat__sex_Male" → "sex_Male"
-        feature_names = [n.split("__", 1)[-1] for n in raw_names]
-        if len(feature_names) != len(importances):
+        try:
+            raw_names = list(preprocessor.get_feature_names_out())
+            # Strip transformer prefix: "cont__alcohol" → "alcohol", "cat__sex_Male" → "sex_Male"
+            feature_names = [n.split("__", 1)[-1] for n in raw_names]
+        except Exception:
+            feature_names = _recover_feature_names_from_preprocessor(preprocessor)
+        if not feature_names or len(feature_names) != len(importances):
             feature_names = [f"f{i}" for i in range(len(importances))]
     except Exception:
         feature_names = [f"f{i}" for i in range(len(importances))]
@@ -158,35 +253,123 @@ def _feature_importance_data(pipeline: Any) -> Optional[tuple[np.ndarray, List[s
     return np.asarray(importances), feature_names
 
 
-def top_feature_importance_summary(pipeline: Any, top_n: int = 5) -> List[Dict[str, float]]:
+def _permutation_feature_importance_data(
+    pipeline: Any,
+    X_test: Any,
+    y_test: Any,
+    is_classification: bool,
+) -> Optional[tuple[np.ndarray, List[str]]]:
+    """Return permutation importances on raw held-out features for unsupported models."""
+    if pipeline is None or X_test is None or y_test is None:
+        return None
+
+    scoring = "balanced_accuracy" if is_classification else "r2"
+    try:
+        result = permutation_importance(
+            pipeline,
+            X_test,
+            y_test,
+            scoring=scoring,
+            n_repeats=5,
+            random_state=42,
+            n_jobs=1,
+        )
+    except Exception:
+        return None
+
+    importances = np.asarray(result.importances_mean, dtype=float)
+    if importances.size == 0:
+        return None
+
+    if hasattr(X_test, "columns"):
+        feature_names = [str(col) for col in X_test.columns]
+    else:
+        feature_names = [f"f{i}" for i in range(len(importances))]
+    if len(feature_names) != len(importances):
+        feature_names = [f"f{i}" for i in range(len(importances))]
+
+    return importances, feature_names
+
+
+def _feature_importance_data(
+    pipeline: Any,
+    X_test: Any = None,
+    y_test: Any = None,
+    is_classification: bool = True,
+) -> tuple[Optional[tuple[np.ndarray, List[str]]], Optional[str]]:
+    """Return available feature-importance data plus the method used."""
+    native = _native_feature_importance_data(pipeline)
+    if native is not None:
+        return native, "native"
+
+    permutation = _permutation_feature_importance_data(
+        pipeline,
+        X_test=X_test,
+        y_test=y_test,
+        is_classification=is_classification,
+    )
+    if permutation is not None:
+        return permutation, "permutation"
+
+    return None, None
+
+
+def top_feature_importance_summary(
+    pipeline: Any,
+    top_n: int = 5,
+    X_test: Any = None,
+    y_test: Any = None,
+    is_classification: bool = True,
+) -> tuple[List[Dict[str, float]], Optional[str]]:
     """Return the top-N feature drivers sorted from strongest to weakest."""
-    payload = _feature_importance_data(pipeline)
+    payload, method = _feature_importance_data(
+        pipeline,
+        X_test=X_test,
+        y_test=y_test,
+        is_classification=is_classification,
+    )
     if payload is None:
-        return []
+        return [], None
 
     importances, feature_names = payload
     n = min(top_n, len(importances))
     if n <= 0:
-        return []
+        return [], method
 
     indices = np.argsort(importances)[-n:][::-1]
-    return [
-        {
-            "feature": str(feature_names[i]),
-            "importance": round(float(importances[i]), 6),
-        }
-        for i in indices
-    ]
+    return (
+        [
+            {
+                "feature": str(feature_names[i]),
+                "importance": round(float(importances[i]), 6),
+            }
+            for i in indices
+        ],
+        method,
+    )
 
 
-def plot_feature_importance(pipeline: Any, out_path: str, title: str, top_n: int = 15) -> Optional[str]:
+def plot_feature_importance(
+    pipeline: Any,
+    out_path: str,
+    title: str,
+    top_n: int = 15,
+    X_test: Any = None,
+    y_test: Any = None,
+    is_classification: bool = True,
+) -> tuple[Optional[str], Optional[str]]:
     """
     Horizontal bar chart of the top-N feature importances (or coefficients) from the best model.
-    Returns the saved path, or None if the model does not support feature_importances_.
+    Returns the saved path plus the method used, or (None, None) if unavailable.
     """
-    payload = _feature_importance_data(pipeline)
+    payload, method = _feature_importance_data(
+        pipeline,
+        X_test=X_test,
+        y_test=y_test,
+        is_classification=is_classification,
+    )
     if payload is None:
-        return None
+        return None, None
 
     importances, feature_names = payload
     n = min(top_n, len(importances))
@@ -204,7 +387,7 @@ def plot_feature_importance(pipeline: Any, out_path: str, title: str, top_n: int
     plt.tight_layout()
     plt.savefig(out_path, dpi=160, bbox_inches="tight")
     plt.close()
-    return out_path
+    return out_path, method
 
 
 def plot_per_class_f1(per_class_f1: Dict[str, float], out_path: str, title: str) -> str:
@@ -686,16 +869,31 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classifi
 
     # Feature importance bar chart — tree-based models only; returns None otherwise
     pipeline = best.get("pipeline")
-    top_features = top_feature_importance_summary(pipeline, top_n=5) if pipeline is not None else []
-    fi_path = (
+    top_features, fi_method = (
+        top_feature_importance_summary(
+            pipeline,
+            top_n=5,
+            X_test=best.get("X_test"),
+            y_test=y_test,
+            is_classification=is_classification,
+        )
+        if pipeline is not None
+        else ([], None)
+    )
+    fi_path, fi_method_from_plot = (
         plot_feature_importance(
             pipeline,
             fi_out_path,
             f"Feature Importance: {best['name']}",
+            X_test=best.get("X_test"),
+            y_test=y_test,
+            is_classification=is_classification,
         )
         if pipeline is not None
-        else None
+        else (None, None)
     )
+    if fi_method is None:
+        fi_method = fi_method_from_plot
     if fi_path is None:
         _remove_artifact_if_exists(fi_out_path)
 
@@ -704,6 +902,7 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classifi
         best_metrics["per_class_f1"] = per_class_f1
     if top_features:
         best_metrics["top_feature_importance"] = top_features
+        best_metrics["feature_importance_method"] = fi_method
         
     # Ethics & Fairness: Calculate Demographic Parity proxy if sensitive cols exist
     # Note: Fairness auditing is currently scoped to classification. Regression fairness is skipped.
@@ -749,6 +948,7 @@ def evaluate_best(training_payload: Dict[str, Any], output_dir: str, is_classifi
         "classification_report": cls_report,
         "regression_plot_path": reg_plot_path if not is_classification else None,
         "feature_importance_path": fi_path,
+        "feature_importance_method": fi_method,
         "top_feature_importance": top_features or None,
         "per_class_f1_path": pcf_path if is_classification else None,
     }
@@ -894,10 +1094,12 @@ def write_markdown_report(
                 fairness_section += f"  - `{group}`: {rate:.1%}\n"
 
     top_features = best.get("top_feature_importance") or eval_payload.get("top_feature_importance") or []
+    feature_importance_method = best.get("feature_importance_method") or eval_payload.get("feature_importance_method")
     feature_driver_section = ""
     if top_features:
+        method_label = "permutation importance" if feature_importance_method == "permutation" else "model-native importance"
         feature_driver_section += "### Top Feature Drivers\n"
-        feature_driver_section += "The strongest model signals in this run were:\n"
+        feature_driver_section += f"The strongest model signals in this run were estimated using {method_label}:\n"
         for item in top_features:
             feature_driver_section += f"- `{item['feature']}`: {item['importance']:.3f}\n"
 

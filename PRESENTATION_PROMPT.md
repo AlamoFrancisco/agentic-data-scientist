@@ -30,6 +30,8 @@ Here is all the context and raw data you need to build the presentation:
 - **Autonomous Target Fallback:** If the user asks the agent to "auto-detect" the target, and it picks a column that turns out to have zero predictable signal, the Reflector aborts the run, saves the target to a "failed" list in memory, and automatically pivots to the next best target candidate.
 - **Statistical Rigor:** Evaluates cross-validation consistency. If the held-out split differs wildly from the CV mean, it triggers a replan to widen the test split.
 
+- **Outlier-Aware Regression Reflection:** If regression performance (R²) is low and the profiler detected outliers, the Reflector explicitly flags this issue and suggests applying robust scaling or using outlier-insensitive models.
+
 ## 4. The "Test Track" (The 5 Evaluation Datasets)
 The agent was tested on 5 distinct datasets to prove its adaptability:
 

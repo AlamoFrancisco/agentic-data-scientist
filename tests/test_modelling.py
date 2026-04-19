@@ -128,6 +128,31 @@ def test_build_preprocessor_handles_integer_categorical_with_robust_imputation()
     assert transformed.shape[0] == len(df)
 
 
+def test_build_preprocessor_drops_one_level_for_binary_categoricals():
+    df = pd.DataFrame({
+        "smoker": ["yes", "no", "yes", "no", "yes", "no"],
+        "target": [1, 0, 1, 0, 1, 0],
+    })
+    profile = {
+        "shape": {"rows": len(df), "cols": len(df.columns)},
+        "feature_types": {
+            "numeric": {"ordinal": [], "continuous": []},
+            "categorical": {"binary": ["smoker"], "multiclass": []},
+            "text": [],
+            "datetime": [],
+            "all_missing": [],
+        },
+        "n_unique_by_col": {"smoker": 2, "target": 2},
+        "imbalance_ratio": 1.0,
+        "is_classification": True,
+    }
+
+    pp = build_preprocessor(profile)
+    transformed = pp.fit_transform(df[["smoker"]], df["target"])
+
+    assert transformed.shape == (len(df), 1)
+
+
 def test_build_preprocessor_drops_high_cardinality_categoricals():
     rng = np.random.default_rng(0)
     n = 200
@@ -201,6 +226,17 @@ def test_select_models_small_dataset_includes_svc():
     assert "SVC_RBF" in names
 
 
+def test_select_models_large_dataset_with_ensemble_preference_excludes_classic_gradient_boosting():
+    profile = make_profile(make_cls_df())
+    profile["shape"]["rows"] = 100_000
+    profile["prefer_ensemble"] = True
+
+    names = [n for n, _ in select_models(profile)]
+
+    assert "GradientBoosting" not in names
+    assert "HistGradientBoosting" in names
+
+
 def test_select_models_respects_use_class_weights_flag():
     profile = make_profile(make_cls_df())
     profile["use_class_weights"] = True
@@ -233,6 +269,16 @@ def test_select_models_regression_simple_models_only_excludes_ensembles():
     profile["simple_models_only"] = True
     names = [n for n, _ in select_models(profile)]
     assert names == ["DummyMean", "LinearRegression", "Ridge"]
+
+
+def test_select_models_large_regression_excludes_classic_gradient_boosting_regressor():
+    profile = make_profile(make_reg_df(), is_classification=False)
+    profile["shape"]["rows"] = 100_000
+
+    names = [n for n, _ in select_models(profile)]
+
+    assert "GradientBoostingRegressor" not in names
+    assert "HistGradientBoostingRegressor" in names
 
 
 def test_select_models_respects_classification_priority():
@@ -569,3 +615,22 @@ def test_tune_best_model_all_metrics_length_unchanged():
     original_count = len(trained["all_metrics"])
     tuned = tune_best_model(trained, seed=42, is_classification=True)
     assert len(tuned["all_metrics"]) == original_count
+
+
+def test_suppress_known_non_actionable_warnings_targets_validate_data_futurewarning(monkeypatch):
+    recorded = {}
+
+    def fake_filterwarnings(action, message="", category=None, module="", **kwargs):
+        recorded["action"] = action
+        recorded["message"] = message
+        recorded["category"] = category
+        recorded["module"] = module
+
+    monkeypatch.setattr(modelling.warnings, "filterwarnings", fake_filterwarnings)
+
+    modelling._suppress_known_non_actionable_warnings()
+
+    assert recorded["action"] == "ignore"
+    assert "BaseEstimator\\._validate_data" in recorded["message"]
+    assert recorded["category"] is FutureWarning
+    assert recorded["module"] == r"sklearn\.base"

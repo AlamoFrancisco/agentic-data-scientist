@@ -108,9 +108,57 @@ _DENSE_MODEL_NAMES = {
     "HistGradientBoostingRegressor",
 }
 
+_SKLEARN_VALIDATE_DATA_FUTUREWARNING = (
+    r"`BaseEstimator\._validate_data` is deprecated in 1\.6 and will be removed in 1\.7\..*"
+)
+
+
+def _suppress_known_non_actionable_warnings() -> None:
+    """
+    Silence dependency deprecation noise that is not actionable in this project.
+
+    This specific sklearn warning can leak from parallel tuning workers and makes
+    long-running jobs look broken even when the run is healthy.
+    """
+    warnings.filterwarnings(
+        "ignore",
+        message=_SKLEARN_VALIDATE_DATA_FUTUREWARNING,
+        category=FutureWarning,
+        module=r"sklearn\.base",
+    )
+
+
+_suppress_known_non_actionable_warnings()
+
 
 def _to_dense_if_sparse(X: Any) -> Any:
     return X.toarray() if sparse.issparse(X) else X
+
+
+def _make_one_to_one_transformer(func: Any, *, accept_sparse: bool = False) -> FunctionTransformer:
+    """
+    Build a FunctionTransformer that preserves input feature names.
+
+    Older scikit-learn versions may not support the ``feature_names_out`` argument,
+    so attach a simple one-to-one fallback when needed.
+    """
+    kwargs: Dict[str, Any] = {"validate": False}
+    if accept_sparse:
+        kwargs["accept_sparse"] = True
+
+    try:
+        return FunctionTransformer(func, feature_names_out="one-to-one", **kwargs)
+    except TypeError:
+        transformer = FunctionTransformer(func, **kwargs)
+
+        def get_feature_names_out(input_features: Optional[List[str]] = None) -> np.ndarray:
+            if input_features is None:
+                n_features = int(getattr(transformer, "n_features_in_", 0))
+                return np.asarray([f"x{i}" for i in range(n_features)], dtype=object)
+            return np.asarray(list(input_features), dtype=object)
+
+        transformer.get_feature_names_out = get_feature_names_out  # type: ignore[attr-defined]
+        return transformer
 
 
 def _coerce_categorical_values(X: Any) -> Any:
@@ -185,7 +233,7 @@ def _build_training_pipeline(
     needs_dense = model_name in _DENSE_MODEL_NAMES or (apply_oversampling and is_classification)
 
     if needs_dense:
-        steps.append(("to_dense", FunctionTransformer(_to_dense_if_sparse, accept_sparse=True)))
+        steps.append(("to_dense", _make_one_to_one_transformer(_to_dense_if_sparse, accept_sparse=True)))
 
     if apply_oversampling and is_classification:
         if HAS_IMBLEARN and smote_k_neighbors is not None:
@@ -293,7 +341,7 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
         high_card_imputer = SimpleImputer(strategy="most_frequent")
 
     continuous_steps = [
-        ("coerce_numeric", FunctionTransformer(_coerce_numeric_values, validate=False)),
+        ("coerce_numeric", _make_one_to_one_transformer(_coerce_numeric_values)),
         ("imputer", continuous_imputer),
         ("scaler", scaler),
     ]
@@ -304,7 +352,7 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     continuous_transformer = Pipeline(steps=continuous_steps)
 
     ordinal_transformer = Pipeline(steps=[
-        ("coerce_numeric", FunctionTransformer(_coerce_numeric_values, validate=False)),
+        ("coerce_numeric", _make_one_to_one_transformer(_coerce_numeric_values)),
         ("imputer", ordinal_imputer),
         ("scaler", scaler),
     ])
@@ -312,12 +360,12 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     # Keep one-hot output sparse to avoid densifying wide categorical spaces.
     # scikit-learn renamed `sparse` -> `sparse_output` (v1.2+). Support both.
     try:
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+        ohe = OneHotEncoder(handle_unknown="ignore", drop="if_binary", sparse_output=True)
     except TypeError:
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse=True)
+        ohe = OneHotEncoder(handle_unknown="ignore", drop="if_binary", sparse=True)
 
     categorical_transformer = Pipeline(steps=[
-        ("coerce_categorical", FunctionTransformer(_coerce_categorical_values, validate=False)),
+        ("coerce_categorical", _make_one_to_one_transformer(_coerce_categorical_values)),
         ("imputer", categorical_imputer),
         ("onehot", ohe),
     ])
@@ -331,7 +379,7 @@ def build_preprocessor(profile: Dict[str, Any]) -> ColumnTransformer:
     # Target encoding for high-cardinality categoricals (only when flag is set)
     if profile.get("use_target_encoding") and high_card_cols:
         target_enc_transformer = Pipeline(steps=[
-            ("coerce_categorical", FunctionTransformer(_coerce_categorical_values, validate=False)),
+            ("coerce_categorical", _make_one_to_one_transformer(_coerce_categorical_values)),
             ("imputer", high_card_imputer),
             ("target_enc", TargetEncoder()),
         ])
@@ -376,11 +424,10 @@ def select_models(
             ("Ridge", Ridge()),
         ]
         if not simple_models_only:
-            candidates.extend([
-                ("RandomForestRegressor", RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=seed, n_jobs=-1)),
-                ("GradientBoostingRegressor", GradientBoostingRegressor(random_state=seed)),
-                ("HistGradientBoostingRegressor", HistGradientBoostingRegressor(random_state=seed)),
-            ])
+            candidates.append(("RandomForestRegressor", RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=seed, n_jobs=-1)))
+            if rows < LARGE_DATASET_ROWS:
+                candidates.append(("GradientBoostingRegressor", GradientBoostingRegressor(random_state=seed)))
+            candidates.append(("HistGradientBoostingRegressor", HistGradientBoostingRegressor(random_state=seed)))
         return prioritize_candidates(candidates, preferred_model)
 
     use_regularization = profile.get("use_regularization", False)
@@ -403,10 +450,11 @@ def select_models(
     if simple_models_only:
         return prioritize_candidates(candidates, preferred_model)
 
-    # Large datasets: always include ensemble models (bucket: >= 10000)
-    # Medium datasets: also include GradientBoosting (bucket: 1000–9999)
+    # Large datasets: allow the scalable histogram variant only.
+    # Medium datasets: also include classic GradientBoosting.
     if prefer_ensemble or rows < LARGE_DATASET_ROWS:
-        candidates.append(("GradientBoosting", GradientBoostingClassifier(random_state=seed)))
+        if rows < LARGE_DATASET_ROWS:
+            candidates.append(("GradientBoosting", GradientBoostingClassifier(random_state=seed)))
         candidates.append(("HistGradientBoosting", HistGradientBoostingClassifier(random_state=seed)))
 
     return prioritize_candidates(candidates, preferred_model)
@@ -831,6 +879,7 @@ def tune_best_model(
     try:
         with warnings.catch_warnings(record=True):
             warnings.simplefilter("always")
+            _suppress_known_non_actionable_warnings()
             search.fit(X_train, y_train)
     except Exception as exc:
         if not _is_parallel_backend_error(exc):
@@ -846,6 +895,7 @@ def tune_best_model(
         )
         with warnings.catch_warnings(record=True):
             warnings.simplefilter("always")
+            _suppress_known_non_actionable_warnings()
             search.fit(X_train, y_train)
 
     tuned_pipeline = search.best_estimator_

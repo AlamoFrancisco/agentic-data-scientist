@@ -70,9 +70,9 @@ A key implementation decision was the **leakage detection fix**. The original sk
 The planner generates an ordered plan by applying a series of conditional checks on the profile. The core pipeline steps are fixed; additional steps are inserted or appended based on the signals detected.
 
 **Size bucket logic** drives model selection and regularization:
-- Rows < 1000 (small): `apply_regularization` (LogisticRegression C=0.1) and `use_simple_models_only` (Dummy + LR + RF only, no GradientBoosting or SVC)
-- Rows 1000–9999 (medium): full model set including GradientBoosting
-- Rows ≥ 10,000 (large): `use_ensemble_models` (tree ensembles favoured unless the dataset is too wide)
+- Rows < 1000 (small): `apply_regularization` (LogisticRegression C=0.1) and `use_simple_models_only` (Dummy + LR + RF, plus `SVC_RBF` when the dataset is not too wide)
+- Rows 1000–9999 (medium): full model set including GradientBoosting and HistGradientBoosting
+- Rows ≥ 10,000 (large): `use_ensemble_models` (tree ensembles favoured unless the dataset is too wide, with classic GradientBoosting excluded on very large workloads in favour of the histogram-based variant)
 
 This bucket logic is consistent across the planner, modelling, and memory components — all three use the same thresholds of 1,000 and 10,000.
 
@@ -92,6 +92,7 @@ Two additional planner extensions improve realism beyond a simple size bucket. F
 
 - **Scaler selection**: StandardScaler by default; RobustScaler when `handle_outliers` or `use_robust_scaling` is set; `RobustScaler(unit_variance=True)` for large datasets with outliers (quantile clamping)
 - **Missing value strategy**: median imputation for numeric, most-frequent for categorical (threshold-based column dropping before this)
+- **Binary categorical encoding**: `OneHotEncoder(drop="if_binary")` keeps one dummy level for two-class categoricals, reducing redundancy and making linear-model explanations cleaner
 - **High-cardinality categoricals**: sklearn's `TargetEncoder` (v1.3+) fitted inside the pipeline to prevent leakage — target means are computed on training data only
 - **Feature dropping**: near-constant, highly correlated, leaky, and high-missing columns are all excluded before the transformers are applied
 
@@ -101,18 +102,28 @@ Models are selected based on the size bucket and profile flags:
 
 | Condition | Models |
 |-----------|--------|
-| `simple_models_only` (small / wide dataset) | DummyClassifier, LogisticRegression, RandomForest |
-| Medium / Large (classification) | + GradientBoosting, HistGradientBoosting |
-| `prefer_ensemble` (large) | tree ensembles explicitly favoured |
-| Regression | DummyRegressor, LinearRegression, Ridge, RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor |
+| `simple_models_only` (small / wide dataset) | DummyClassifier, LogisticRegression, RandomForest, and `SVC_RBF` when `cols <= 50` |
+| Medium (classification) | + GradientBoosting, HistGradientBoosting |
+| Large (classification) | RandomForest + HistGradientBoosting; classic GradientBoosting is skipped to avoid pathological runtimes |
+| Regression | DummyRegressor, LinearRegression, Ridge, RandomForestRegressor, HistGradientBoostingRegressor, with classic GradientBoostingRegressor reserved for smaller workloads |
 
 A dummy baseline is always included. This is critical for the reflector — all performance assessments are relative to baseline improvement.
 
-SVC was restricted to datasets with fewer than 1,000 rows and 50 columns, and `probability=True` was removed since Platt scaling adds significant training cost and probabilities are never used by the evaluation layer.
+SVC was restricted to datasets with fewer than 1,000 rows and 50 columns, and `probability=True` was removed since Platt scaling adds significant training cost and probabilities are never used by the evaluation layer. Additional stress testing on `covtype.csv` showed that classic GradientBoosting should never be attempted on very large tabular datasets, so the large-dataset path now prefers HistGradientBoosting instead.
 
 ### Metrics
 
 Classification uses balanced accuracy and macro-averaged F1 as primary metrics (to handle class imbalance). Regression uses R², MAE, and RMSE. The best model is selected by balanced accuracy + F1 for classification, R² for regression.
+
+### Explanation Layer
+
+The evaluator now supports three explanation paths:
+
+- **Model-native importances** for tree ensembles via `feature_importances_`
+- **Coefficient-based importances** for linear models using absolute coefficient magnitude
+- **Permutation importance fallback** for models without native importances, such as `SVC_RBF`
+
+Recent testing surfaced several explanation-layer issues that were then fixed. Feature-importance artefacts are now cleaned up when a final model does not support the chart that an earlier candidate produced, transformed feature names are recovered instead of falling back to generic placeholders like `f0`, and binary one-hot encoding no longer produces duplicated mirror-image pairs such as `smoker_yes` / `smoker_no`. The remaining limitation is that explanations are still reported at the transformed feature level rather than always being aggregated back to the original raw feature.
 
 ---
 
@@ -234,6 +245,8 @@ The agent detects leakage through mutual information analysis but only at the in
 ### Proxy Features and Fairness
 The leakage detector flags features that are near-perfect proxies of the target. Additionally, the profiler actively scans for sensitive attributes (e.g., gender, race, age) and automatically drops them to prevent direct algorithmic bias. During the evaluation phase, the agent computes a Demographic Parity proxy to audit the model for disparate impacts across protected groups, ensuring fairness issues are surfaced to human reviewers.
 
+Recent testing on `adult.csv` showed the key limitation of this approach: dropping explicit sensitive columns does not remove proxy information. Even with `age`, `race`, `sex`, and `marital_status` removed, the strongest remaining drivers still included relationship-based features that act as indirect correlates. This means the current fairness layer is useful for surfacing risk, but it should not be interpreted as solving proxy discrimination.
+
 ### Imbalance Handling
 Class weights are applied automatically when imbalance ratio ≥ 3.0. For severe imbalance (ratio ≥ 5.0), the planner dynamically injects an oversampling step that utilises SMOTE (Synthetic Minority Over-sampling Technique) to artificially balance the training data, provided the `imbalanced-learn` library is available.
 
@@ -245,6 +258,9 @@ All previously dead flags from the original skeleton have been resolved: `robust
 
 ### Replan Effectiveness
 The replan mechanism works correctly for performance-based issues (weak F1, poor R²). For structural issues like multiplicative leakage, the replanner currently has no handler — it adds `replan_attempt` to the plan but changes nothing in the second run. The correct fix would be to progressively lower the MI leakage threshold during replanning, catching features that individually fall below 0.9 but together construct the target.
+
+### Warning Interpretation
+Training and cross-validation warnings are captured and surfaced to the report, but the current verdict logic remains slightly optimistic in one important case: actionable numerical warnings do not automatically downgrade the final verdict if held-out and cross-validation performance are still strong. This was observed on `telco_churn.csv` and `breast_cancer.csv`, where overflow/divide-by-zero warnings were recorded even though the final summary still labelled the run as "Reliable result". Human review is therefore still advisable when the warning sections are non-empty.
 
 ### Scope
 The agent is designed for tabular, offline batch processing. It has no support for streaming data, time series, image or text-heavy datasets, or deployment.
@@ -260,7 +276,7 @@ Four datasets were used to validate the agent across different scenarios:
 | `titanic.csv` | 784 | Classification | LogisticRegression | bal_acc=0.825, f1=0.828 | outliers, missing_data, robust_scaling, leaky `alive` dropped, CV-gap replan |
 | `digits.csv` | 1797 | Classification | RandomForest | bal_acc=0.972, f1=0.972 | outliers, 14 near-constant pixel cols dropped |
 | `Sales.csv` | 30000 | Regression | RandomForestRegressor | R²=1.000 (suspicious) | target_encoding, sensitive feature dropped, reduced tuning budget, soft leakage review |
-| `telco_churn.csv` | 7043 | Classification | LogisticRegression | bal_acc=0.723, f1=0.733 | robust_scaling, sensitive feature dropped, hyperparameter tuning |
+| `telco_churn.csv` | 7043 | Classification | LogisticRegression | bal_acc=0.723, f1=0.733 | robust_scaling, sensitive feature dropped, tuning skipped after instability warnings |
 
 **Titanic (survival classification):** The Titanic run demonstrates several adaptive behaviours working together. The `alive` column — a string encoding of whether the passenger survived — was correctly flagged as leaky via mutual information (normalised MI = 1.0) and dropped before training. The `deck` column (77% missing values) triggered `handle_severe_missing_data`. Scale mismatch between `fare` (0–512) and ordinal features like `pclass` (1–3) triggered RobustScaler. The held-out score (balanced accuracy 0.853) differed noticeably from the 5-fold cross-validation mean (0.770), triggering the CV-gap replan: the test split was widened from 20% to 30% to obtain a more representative held-out estimate. After the replan, LogisticRegression achieved balanced accuracy 0.825 and macro F1 0.828 — a strong outcome for this well-studied dataset, achieved through fully automated adaptive preprocessing. Memory was correctly updated and the second run prioritised LogisticRegression, improving run efficiency.
 
@@ -268,7 +284,9 @@ Four datasets were used to validate the agent across different scenarios:
 
 **Sales (revenue regression):** The Sales dataset provided the most instructive run. `final_price_usd` was correctly flagged as a soft leakage signal (normalised MI = 1.0 with `revenue_usd`) and `model_name` (899 unique product names) was target-encoded rather than dropped. The planner also dropped the sensitive `gender` column and reduced the tuning budget because the workload was large (`30,000 × 18`). Soft leakage signals are not automatically removed — they surface as `Use with caution` verdicts requiring human review, because high MI alone is not proof that a feature is unavailable at prediction time. With `final_price_usd` still in the feature set (along with `units_sold`), RandomForestRegressor achieved R² = 1.000 trivially, since `revenue_usd = final_price_usd × units_sold` exactly. The reflector correctly raised a `needs_attention` warning with a suspicious near-perfect R² issue. This demonstrates both the strength of the leakage detector (caught the high-MI proxy and surfaced it) and the intentional design choice to prefer human review over silent feature removal for soft signals.
 
-**Telco Churn (customer churn classification):** This dataset perfectly demonstrated the agent's ability to handle dirty data and class imbalance. The `TotalCharges` column contained blank spaces, which initially caused pandas to load it as a string. The agent's schema profiler successfully coerced the string column to numeric, recovering the data and triggering `RobustScaler` to handle its massive scale range. Because the dataset has a class imbalance, the agent automatically applied class weights. It safely bypassed benign math warnings during training to successfully tune the `LogisticRegression` model, achieving a reliable balanced accuracy of 0.723.
+**Telco Churn (customer churn classification):** This dataset demonstrated the agent's ability to handle dirty mixed-type data. The `TotalCharges` column contained blank spaces, which initially caused pandas to load it as a string. The profiler and preprocessing pipeline successfully coerced the column back to numeric, and the large scale range triggered `RobustScaler`. In the validated run, numerical-instability warnings appeared during candidate training, so hyperparameter tuning was skipped and the agent proceeded directly to cross-validation. Even with that conservative path, `LogisticRegression` still achieved balanced accuracy 0.723 with a stable 3-fold cross-validation estimate around 0.719. This makes the run usable, but it also illustrates the current limitation that warning-heavy runs can still be summarised slightly too optimistically.
+
+**Additional stress testing (Adult, Breast Cancer, Covtype):** Post-report validation on additional datasets materially improved the product. `adult.csv` highlighted the proxy-fairness limitation described above. `breast_cancer.csv` showed that the final model-selection policy behaves sensibly when cross-validation slightly prefers `SVC_RBF` but the difference from `LogisticRegression` is not statistically significant. `covtype.csv` exposed a large-dataset planning flaw: classic GradientBoosting was being admitted on a 581k-row workload, causing pathological runtimes. The fix was to gate very large datasets to scalable ensembles such as HistGradientBoosting and RandomForest only.
 
 ---
 
@@ -288,13 +306,14 @@ This project implements a functioning offline agentic data scientist that adapts
 10. **Statistical significance testing** via paired t-test on CV fold scores, comparing the best and runner-up model
 11. **Adaptive F1 threshold** adjusted by class imbalance ratio so minority-class difficulty is not penalised unfairly
 12. **Per-class F1 analysis** flagging specific underperforming classes beyond macro-averaged metrics
-13. **Feature importance and per-class F1 visualisations** saved automatically for tree-based models and classification runs
+13. **Feature explanation support** for tree ensembles, linear models, and unsupported models via permutation-importance fallback, with improved transformed-feature name recovery and stale-artefact cleanup
 14. **Centralised configuration** (`config.py`) making all thresholds and hyperparameters visible and adjustable in one place
 15. **Algorithmic fairness audits** including sensitive attribute detection, exclusion, and demographic parity calculations
 16. **SMOTE integration** for dynamically handling severely imbalanced datasets
 17. **Low-dimensional polynomial feature engineering** for simple non-linear signal capture
 18. **Cost-aware compute estimation** to scale down tuning budgets for massive datasets
 19. **High-dimensional planning rules** that bias wide datasets toward simpler, more regularised search
+20. **Cleaner categorical encoding for explanation** through binary one-hot drop (`drop="if_binary"`) to avoid mirrored duplicate features in reports
 
 Future work would address the identified limitations, such as implementing progressive leakage threshold reduction during replanning and broadening feature engineering beyond the current low-dimensional quadratic expansion.
 

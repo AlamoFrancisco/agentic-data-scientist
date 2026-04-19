@@ -11,12 +11,14 @@ import pandas as pd
 import pytest
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 
 from tools import evaluation as evaluation_module
 from tools.evaluation import derive_run_verdict, evaluate_best, write_markdown_report
+from tools.modelling import build_preprocessor
 
 
 # ── fake context ──────────────────────────────────────────────────────────────
@@ -139,6 +141,148 @@ def cls_payload_with_pipeline():
     }
 
 
+def cls_payload_with_svc_pipeline():
+    X_train = pd.DataFrame(
+        {
+            "signal": [0, 0, 0, 1, 1, 1, 1, 0],
+            "noise": [0.2, 0.3, 0.1, 0.7, 0.8, 0.9, 0.75, 0.25],
+        }
+    )
+    y_train = pd.Series([0, 0, 0, 1, 1, 1, 1, 0])
+    X_test = pd.DataFrame(
+        {
+            "signal": [0, 1, 0, 1],
+            "noise": [0.15, 0.85, 0.2, 0.8],
+        }
+    )
+    y_test = pd.Series([0, 1, 0, 1])
+
+    preprocess = ColumnTransformer(
+        transformers=[
+            (
+                "cont",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scale", StandardScaler()),
+                    ]
+                ),
+                ["signal", "noise"],
+            )
+        ]
+    )
+    pipeline = Pipeline(
+        steps=[
+            ("preprocess", preprocess),
+            ("model", SVC(kernel="rbf")),
+        ]
+    )
+    pipeline.fit(X_train, y_train)
+    y_pred = pipeline.predict(X_test)
+
+    best = {
+        "name": "SVC_RBF",
+        "pipeline": pipeline,
+        "metrics": {
+            "model": "SVC_RBF",
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "f1_macro": 1.0,
+            "precision_macro": 1.0,
+            "recall_macro": 1.0,
+        },
+        "X_test": X_test,
+        "y_test": y_test,
+        "y_pred": y_pred,
+    }
+    return {
+        "best": best,
+        "results": [best],
+        "all_metrics": [
+            {
+                "model": "SVC_RBF",
+                "accuracy": 1.0,
+                "balanced_accuracy": 1.0,
+                "f1_macro": 1.0,
+            }
+        ],
+    }
+
+
+def reg_payload_with_named_preprocessor(monkeypatch):
+    df = pd.DataFrame(
+        {
+            "bmi": [21.0, 23.5, 27.2, 31.8, 29.1, 34.4, 25.7, 28.3],
+            "children": [0, 1, 2, 3, 2, 4, 1, 0],
+            "smoker": ["no", "no", "yes", "yes", "no", "yes", "no", "yes"],
+            "region": ["southwest", "southeast", "northeast", "northwest", "southwest", "northeast", "northwest", "southeast"],
+            "charges": [2200, 3400, 16800, 22100, 9800, 28500, 5200, 19000],
+        }
+    )
+    X = df.drop(columns=["charges"])
+    y = df["charges"]
+
+    profile = {
+        "shape": {"rows": len(df), "cols": len(df.columns)},
+        "feature_types": {
+            "numeric": {"ordinal": [], "continuous": ["bmi", "children"]},
+            "categorical": {"binary": ["smoker"], "multiclass": ["region"]},
+            "text": [],
+            "datetime": [],
+            "all_missing": [],
+        },
+        "n_unique_by_col": {col: int(df[col].nunique(dropna=True)) for col in df.columns},
+        "missing_pct": {col: 0.0 for col in df.columns},
+        "near_constant_cols": [],
+        "corr_cols_to_drop": [],
+        "leaky_col_names": [],
+        "sensitive_cols": [],
+        "drop_high_corr": False,
+        "drop_leaky": False,
+        "drop_sensitive": False,
+        "robust_imputation": False,
+        "use_robust_scaling": False,
+        "handle_outliers": False,
+        "use_feature_engineering": True,
+        "use_target_encoding": False,
+    }
+
+    preprocess = build_preprocessor(profile)
+    pipeline = Pipeline(
+        steps=[
+            ("preprocess", preprocess),
+            ("model", LinearRegression()),
+        ]
+    )
+    pipeline.fit(X, y)
+
+    # Force evaluation through the manual recovery path.
+    monkeypatch.setattr(
+        pipeline.named_steps["preprocess"],
+        "get_feature_names_out",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AttributeError("boom")),
+    )
+
+    y_pred = pipeline.predict(X)
+    best = {
+        "name": "LinearRegression",
+        "pipeline": pipeline,
+        "metrics": {
+            "model": "LinearRegression",
+            "r2": 0.9,
+            "mae": 1000.0,
+            "rmse": 1200.0,
+        },
+        "X_test": X,
+        "y_test": y,
+        "y_pred": y_pred,
+    }
+    return {
+        "best": best,
+        "all_metrics": [{"model": "LinearRegression", "r2": 0.9}],
+    }
+
+
 # ── evaluate_best ─────────────────────────────────────────────────────────────
 
 def test_evaluate_best_classification_returns_metrics(tmp_path):
@@ -204,6 +348,31 @@ def test_evaluate_best_includes_top_feature_importance_summary(tmp_path):
     assert len(top_features) == 2
     assert {item["feature"] for item in top_features} == {"signal", "noise"}
     assert top_features[0]["importance"] >= top_features[1]["importance"]
+
+
+def test_evaluate_best_uses_permutation_importance_for_unsupported_models(tmp_path):
+    result = evaluate_best(cls_payload_with_svc_pipeline(), str(tmp_path), is_classification=True)
+    top_features = result["best_metrics"]["top_feature_importance"]
+
+    assert result["feature_importance_path"] is not None
+    assert os.path.exists(result["feature_importance_path"])
+    assert result["feature_importance_method"] == "permutation"
+    assert result["best_metrics"]["feature_importance_method"] == "permutation"
+    assert {item["feature"] for item in top_features} == {"signal", "noise"}
+
+
+def test_evaluate_best_recovers_real_feature_names_when_preprocessor_name_export_fails(tmp_path, monkeypatch):
+    result = evaluate_best(reg_payload_with_named_preprocessor(monkeypatch), str(tmp_path), is_classification=False)
+    top_features = [item["feature"] for item in result["best_metrics"]["top_feature_importance"]]
+
+    assert result["feature_importance_method"] == "native"
+    assert top_features
+    assert all(not feature.startswith("f") for feature in top_features)
+    assert any(
+        stem in feature
+        for feature in top_features
+        for stem in ("bmi", "children", "smoker", "region")
+    )
 
 
 def test_evaluate_best_removes_stale_feature_importance_when_unsupported(tmp_path):
@@ -324,6 +493,20 @@ def test_write_markdown_report_lists_top_feature_drivers(tmp_path):
     assert "Top Feature Drivers" in content
     assert "`signal`" in content
     assert "`noise`" in content
+
+
+def test_write_markdown_report_labels_permutation_importance(tmp_path):
+    out = str(tmp_path / "report.md")
+    eval_result = evaluate_best(cls_payload_with_svc_pipeline(), str(tmp_path), is_classification=True)
+    write_markdown_report(
+        out_path=out, ctx=FakeCtx(), fingerprint="fp_perm",
+        dataset_profile=_cls_profile(),
+        plan=["profile_dataset", "train_models"],
+        eval_payload=eval_result,
+        reflection={"status": "ok", "issues": [], "suggestions": [], "replan_recommended": False, "training_warnings": []},
+    )
+    content = open(out).read()
+    assert "permutation importance" in content
 
 
 def test_write_markdown_report_uses_confidence_aware_summary_language(tmp_path):

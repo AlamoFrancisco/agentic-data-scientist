@@ -319,6 +319,17 @@ def reflect(
                 "Inspect features for target proxies or columns that deterministically "
                 "derive the target (e.g. multiplicative combinations)."
             )
+        
+        # Outlier analysis for regression: if R² is low and outliers are present, suggest robust scaling
+        outlier_cols = dataset_profile.get("outlier_cols", [])
+        if outlier_cols and r2 < R2_LOW_THRESHOLD:
+            issues.append(
+                f"Outliers detected in {len(outlier_cols)} columns and R² is low ({r2:.3f})."
+            )
+            suggestions.append(
+                "Outliers may be distorting the model. Consider applying robust scaling "
+                "or using models less sensitive to extreme values."
+            )
 
         check_cv_consistency(r2, "r2")
 
