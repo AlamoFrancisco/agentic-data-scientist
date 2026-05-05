@@ -239,33 +239,3 @@ python3 -m pytest --cov=agents --cov=tools --cov=agentic_data_scientist --cov-re
 
 Current local suite includes **205 test cases** and is expected to run clean before submission.
 
-## Presentation Materials
-
-- The final Deliverable 3 artefacts are `slides.pdf` and `demo.mp4`.
-
----
-
-## Submission Checklist
-
-- [x] All code runs without errors
-- [x] README.md updated with actual implementation details
-- [x] requirements.txt includes all dependencies (`scikit-learn>=1.3.0`, `imbalanced-learn`)
-- [x] Datasets documented in `data/README.md`
-- [x] Technical report completed — `report/REPORT.md` (~4,000 words)
-- [x] Test coverage > 60% (local coverage target met)
-- [x] All core components extended significantly
-- [x] At least 3 advanced features implemented
-- [x] Repository is organised for submission
-
----
-
-## Academic Integrity
-
-This is individual work. AI assistance was used and is disclosed in the technical report.
-
----
-
-## Important Deadlines
-
-- **Final Project Demonstration:** 21 April 2026, 13:59:59
-- **Final Project Code:** 21 April 2026, 13:59:59
