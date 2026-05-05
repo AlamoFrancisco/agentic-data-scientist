@@ -1,9 +1,7 @@
-# CE888 Agentic Data Scientist
+# Agentic Data Scientist
 
 **Name:** Francisco Antonio Alamo Rios  
 **Assignment:** Offline Agentic AI for Data Science  
-**Module:** CE888  
-**Academic Year:** 2025/2026
 
 ---
 
